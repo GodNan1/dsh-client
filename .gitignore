@@ -1,0 +1,12 @@
+# 本地机器配置（含绝对路径，不入库）
+config.json
+
+# 运行产物
+logs/
+_compile.log
+selftest.txt
+
+# 系统杂项
+Thumbs.db
+Desktop.ini
+.DS_Store
