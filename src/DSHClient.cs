@@ -855,7 +855,7 @@ namespace DSHClient
             bSet.Size = new Size(88, 32);
             bSet.Click += delegate
             {
-                if (_settingsForm == null || _settingsForm.IsDisposed) _settingsForm = new SettingsForm(_cfg);
+                if (_settingsForm == null || _settingsForm.IsDisposed) _settingsForm = new SettingsForm(_cfg, _app);
                 _settingsForm.ShowDialog(this);
                 UpdatePeriod();
             };
@@ -1148,6 +1148,7 @@ namespace DSHClient
     internal class SettingsForm : Form
     {
         private readonly Config _cfg;
+        private readonly App _app;
         private readonly TextBox _tCheckout;
         private readonly TextBox _tNode;
         private readonly TextBox _tPort;
@@ -1156,9 +1157,10 @@ namespace DSHClient
         private readonly CheckBox _cOpen;
         private readonly CheckBox _cTray;
 
-        public SettingsForm(Config cfg)
+        public SettingsForm(Config cfg, App app)
         {
             _cfg = cfg;
+            _app = app;
             this.Text = "设置";
             this.ClientSize = new Size(430, 366);
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -1201,6 +1203,14 @@ namespace DSHClient
             _cOpen = new CheckBox(); _cOpen.Text = "服务就绪后自动打开浏览器"; _cOpen.Checked = cfg.autoOpenBrowser; _cOpen.Location = new Point(16, 278); _cOpen.AutoSize = true;
             _cTray = new CheckBox(); _cTray.Text = "最小化时隐藏到系统托盘"; _cTray.Checked = cfg.minimizeToTray; _cTray.Location = new Point(16, 300); _cTray.AutoSize = true;
 
+            Button bInstall = new Button(); bInstall.Text = "安装 DSH…"; bInstall.Location = new Point(16, 326); bInstall.Size = new Size(100, 30);
+            bInstall.Click += delegate
+            {
+                using (InstallDshForm dlg = new InstallDshForm(_cfg, _app))
+                {
+                    dlg.ShowDialog(this);
+                }
+            };
             Button bOk = new Button(); bOk.Text = "保存"; bOk.DialogResult = DialogResult.OK; bOk.Location = new Point(234, 326); bOk.Size = new Size(90, 30);
             bOk.Click += delegate { SaveAndClose(); };
             Button bCancel = new Button(); bCancel.Text = "取消"; bCancel.DialogResult = DialogResult.Cancel; bCancel.Location = new Point(330, 326); bCancel.Size = new Size(90, 30);
@@ -1211,7 +1221,7 @@ namespace DSHClient
             Controls.Add(l4); Controls.Add(_tPeak); Controls.Add(l4c);
             Controls.Add(l5); Controls.Add(_tApiKey);
             Controls.Add(_cOpen); Controls.Add(_cTray);
-            Controls.Add(bOk); Controls.Add(bCancel);
+            Controls.Add(bInstall); Controls.Add(bOk); Controls.Add(bCancel);
             AcceptButton = bOk;
             CancelButton = bCancel;
         }
@@ -1654,6 +1664,310 @@ namespace DSHClient
             else
             {
                 AppendOutput("> 已取消自动处理，可手动编辑 pnpm-workspace.yaml 后重试。\r\n");
+            }
+        }
+    }
+
+    // 安装 DSH 向导：克隆官方仓库 → pnpm install → pnpm run build → 自动配置客户端
+    internal class InstallDshForm : Form
+    {
+        private readonly Config _cfg;
+        private readonly App _app;
+        private readonly TextBox _tDir;
+        private readonly TextBox _tUrl;
+        private readonly TextBox _tOutput;
+        private readonly Label _lblStep;
+        private readonly ProgressBar _bar;
+        private readonly Button _btnStart;
+        private readonly Button _btnCancel;
+        private bool _busy;
+        private bool _cancelled;
+        private Process _currentProc;
+
+        public const string DefaultRepo = "https://github.com/deepseek-ai/deepseek-harness.git";
+
+        public InstallDshForm(Config cfg, App app)
+        {
+            _cfg = cfg;
+            _app = app;
+            this.Text = "安装 DSH";
+            this.ClientSize = new Size(760, 560);
+            this.StartPosition = FormStartPosition.CenterParent;
+            this.Font = new Font("Microsoft YaHei UI", 9F);
+
+            Label l1 = new Label(); l1.Text = "安装目录："; l1.Location = new Point(14, 14); l1.AutoSize = true;
+            _tDir = new TextBox(); _tDir.Location = new Point(90, 12); _tDir.Size = new Size(498, 23);
+            _tDir.Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "deepseek-harness");
+            Button bBrowse = new Button(); bBrowse.Text = "浏览…"; bBrowse.Location = new Point(596, 11); bBrowse.Size = new Size(90, 26);
+            bBrowse.Click += delegate
+            {
+                using (FolderBrowserDialog dlg = new FolderBrowserDialog())
+                {
+                    dlg.Description = "选择 DSH 安装目录（将在此目录克隆仓库）";
+                    try { dlg.SelectedPath = Path.GetDirectoryName(_tDir.Text); } catch { }
+                    if (dlg.ShowDialog(this) == DialogResult.OK) _tDir.Text = dlg.SelectedPath;
+                }
+            };
+
+            Label l2 = new Label(); l2.Text = "仓库地址："; l2.Location = new Point(14, 44); l2.AutoSize = true;
+            _tUrl = new TextBox(); _tUrl.Location = new Point(90, 42); _tUrl.Size = new Size(596, 23);
+            _tUrl.Text = DefaultRepo;
+
+            Label l3 = new Label();
+            l3.Text = "流程：检查环境（git / node / pnpm）→ 克隆仓库 → pnpm install → pnpm run build → 自动配置客户端指向新目录";
+            l3.Location = new Point(14, 74); l3.AutoSize = true; l3.ForeColor = Color.DimGray;
+
+            _bar = new ProgressBar(); _bar.Location = new Point(14, 102); _bar.Size = new Size(732, 20);
+            _bar.Minimum = 0; _bar.Maximum = 100; _bar.Value = 0;
+
+            _lblStep = new Label(); _lblStep.Location = new Point(14, 128); _lblStep.Size = new Size(732, 22);
+            _lblStep.Text = "就绪";
+
+            _btnStart = new Button(); _btnStart.Text = "开始安装"; _btnStart.Location = new Point(14, 154); _btnStart.Size = new Size(96, 30);
+            _btnStart.Click += delegate { StartInstall(); };
+            _btnCancel = new Button(); _btnCancel.Text = "取消"; _btnCancel.Location = new Point(116, 154); _btnCancel.Size = new Size(96, 30);
+            _btnCancel.Click += delegate { CancelInstall(); };
+
+            _tOutput = new TextBox(); _tOutput.Location = new Point(14, 194); _tOutput.Size = new Size(732, 352);
+            _tOutput.Multiline = true; _tOutput.ReadOnly = true; _tOutput.ScrollBars = ScrollBars.Both;
+            _tOutput.WordWrap = false; _tOutput.Font = new Font("Consolas", 9F);
+
+            Controls.Add(l1); Controls.Add(_tDir); Controls.Add(bBrowse);
+            Controls.Add(l2); Controls.Add(_tUrl);
+            Controls.Add(l3);
+            Controls.Add(_bar); Controls.Add(_lblStep);
+            Controls.Add(_btnStart); Controls.Add(_btnCancel);
+            Controls.Add(_tOutput);
+        }
+
+        private void AppendOutput(string text)
+        {
+            try
+            {
+                this.Invoke((Action)delegate
+                {
+                    _tOutput.AppendText(text);
+                    if (_tOutput.TextLength > 400000)
+                        _tOutput.Text = _tOutput.Text.Substring(_tOutput.TextLength - 300000);
+                    _tOutput.SelectionStart = _tOutput.TextLength;
+                    _tOutput.ScrollToCaret();
+                });
+            }
+            catch { }
+        }
+
+        private void SetStep(string text, int progress)
+        {
+            try
+            {
+                this.Invoke((Action)delegate
+                {
+                    _lblStep.Text = text;
+                    _bar.Value = Math.Min(100, Math.Max(0, progress));
+                });
+            }
+            catch { }
+        }
+
+        private void CancelInstall()
+        {
+            if (!_busy) { this.Close(); return; }
+            _cancelled = true;
+            try { if (_currentProc != null && !_currentProc.HasExited) _currentProc.Kill(); } catch { }
+            _lblStep.Text = "正在取消…";
+        }
+
+        private void StartInstall()
+        {
+            if (_busy) return;
+            string dir = _tDir.Text.Trim().TrimEnd('\\', '/');
+            string url = _tUrl.Text.Trim();
+            if (string.IsNullOrEmpty(dir)) { MessageBox.Show("请填写安装目录。", "安装 DSH"); return; }
+            if (string.IsNullOrEmpty(url)) { MessageBox.Show("请填写仓库地址。", "安装 DSH"); return; }
+
+            _busy = true;
+            _cancelled = false;
+            _btnStart.Enabled = false;
+            _btnCancel.Enabled = true;
+            _tOutput.Clear();
+
+            Thread t = new Thread(delegate() { RunInstall(dir, url); });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void RunInstall(string dir, string url)
+        {
+            try
+            {
+                // 0) 环境检查
+                SetStep("检查环境…", 2);
+                List<string> missing = new List<string>();
+                if (!CheckTool(_cfg.ResolvedNodePath, "--version")) missing.Add("node.js");
+                if (!CheckTool("git", "--version")) missing.Add("git");
+                if (!CheckTool("cmd.exe", "/c pnpm --version")) missing.Add("pnpm");
+                if (missing.Count > 0)
+                {
+                    AppendOutput("> 缺少依赖：" + string.Join("、", missing.ToArray()) + "\r\n");
+                    AppendOutput("> 请先安装这些依赖（node / git 安装后重启客户端）再试。\r\n");
+                    Finish(false, "缺少依赖：" + string.Join("、", missing.ToArray()));
+                    return;
+                }
+                AppendOutput("> 环境检查通过（node / git / pnpm）\r\n");
+
+                // 1) 目录准备与克隆
+                SetStep("准备目录…", 8);
+                string parent = Path.GetDirectoryName(dir);
+                if (string.IsNullOrEmpty(parent)) parent = dir;
+                Directory.CreateDirectory(parent);
+                string marker = Path.Combine(dir, "apps\\cli\\src\\bin.ts");
+                if (File.Exists(marker))
+                {
+                    AppendOutput("> 检测到已有 DSH 仓库，跳过克隆：\r\n>   " + dir + "\r\n");
+                }
+                else
+                {
+                    if (Directory.Exists(dir))
+                    {
+                        string[] entries = Directory.GetFileSystemEntries(dir);
+                        if (entries.Length > 0)
+                        {
+                            AppendOutput("> 目录非空且不是 DSH 仓库：" + dir + "\r\n");
+                            AppendOutput("> 请换一个空目录，或删除该目录后重试。\r\n");
+                            Finish(false, "目标目录非空且不是 DSH 仓库");
+                            return;
+                        }
+                    }
+                    SetStep("克隆仓库（首次较慢）…", 15);
+                    if (!RunStep("git clone --depth 1 " + url, "git",
+                        "clone --depth 1 \"" + url + "\" \"" + dir + "\"", parent))
+                    {
+                        Finish(false, "克隆仓库失败（检查网络/地址）");
+                        return;
+                    }
+                }
+
+                // 2) pnpm install
+                if (_cancelled) return;
+                SetStep("安装依赖（pnpm install，较慢）…", 45);
+                if (!RunStep("pnpm install", "cmd.exe", "/c pnpm install", dir))
+                {
+                    Finish(false, "安装依赖失败");
+                    return;
+                }
+
+                // 3) pnpm run build
+                if (_cancelled) return;
+                SetStep("构建产物（pnpm run build，较慢）…", 75);
+                if (!RunStep("pnpm run build", "cmd.exe", "/c pnpm run build", dir))
+                {
+                    Finish(false, "构建失败（可查看上方输出）");
+                    return;
+                }
+
+                if (_cancelled) return;
+
+                // 4) 配置客户端
+                SetStep("配置客户端…", 97);
+                _cfg.checkoutPath = dir;
+                _cfg.Save();
+                AppendOutput("> 已把客户端「DSH 仓库目录」指向：" + dir + "\r\n");
+                Finish(true, "DSH 安装完成！客户端已指向新目录。");
+            }
+            catch (Exception ex)
+            {
+                Finish(false, "安装出错：" + ex.Message);
+            }
+        }
+
+        private bool CheckTool(string exe, string args)
+        {
+            try
+            {
+                Process p = new Process();
+                p.StartInfo.FileName = exe;
+                p.StartInfo.Arguments = args;
+                p.StartInfo.UseShellExecute = false;
+                p.StartInfo.CreateNoWindow = true;
+                p.StartInfo.RedirectStandardOutput = true;
+                p.StartInfo.RedirectStandardError = true;
+                p.Start();
+                p.WaitForExit(15000);
+                return p.ExitCode == 0;
+            }
+            catch { return false; }
+        }
+
+        private bool RunStep(string name, string fileName, string args, string workDir)
+        {
+            AppendOutput("\r\n=== " + name + " ===\r\n");
+            try
+            {
+                Process p = new Process();
+                _currentProc = p;
+                p.StartInfo.FileName = fileName;
+                p.StartInfo.Arguments = args;
+                p.StartInfo.WorkingDirectory = workDir;
+                p.StartInfo.UseShellExecute = false;
+                p.StartInfo.CreateNoWindow = true;
+                p.StartInfo.RedirectStandardOutput = true;
+                p.StartInfo.RedirectStandardError = true;
+                p.StartInfo.StandardOutputEncoding = Encoding.UTF8;
+                p.StartInfo.StandardErrorEncoding = Encoding.UTF8;
+                p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+                { if (e.Data != null) AppendOutput(e.Data + "\r\n"); };
+                p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+                { if (e.Data != null) AppendOutput(e.Data + "\r\n"); };
+                p.Start();
+                p.BeginOutputReadLine();
+                p.BeginErrorReadLine();
+                p.WaitForExit();
+                Thread.Sleep(200);
+                return p.ExitCode == 0;
+            }
+            catch (Exception ex)
+            {
+                AppendOutput("> 执行失败: " + ex.Message + "\r\n");
+                return false;
+            }
+            finally { _currentProc = null; }
+        }
+
+        private void Finish(bool ok, string msg)
+        {
+            _busy = false;
+            try
+            {
+                this.Invoke((Action)delegate
+                {
+                    _btnStart.Enabled = true;
+                    _btnCancel.Enabled = true;
+                    _lblStep.Text = ok ? "完成" : "失败";
+                    if (_cancelled) return;
+                    MessageBox.Show(this, msg, "安装 DSH",
+                        MessageBoxButtons.OK, ok ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+                    if (ok)
+                    {
+                        DialogResult r = MessageBox.Show(this, "是否立即重启服务，使用新安装的 DSH？", "安装 DSH",
+                            MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                        if (r == DialogResult.Yes) RestartService();
+                    }
+                });
+            }
+            catch { }
+        }
+
+        private void RestartService()
+        {
+            try
+            {
+                _app.Stop();
+                _app.Start();
+                AppendOutput("> 服务已重启。\r\n");
+            }
+            catch (Exception ex)
+            {
+                AppendOutput("> 重启失败: " + ex.Message + "\r\n");
             }
         }
     }
