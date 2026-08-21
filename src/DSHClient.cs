@@ -921,8 +921,9 @@ namespace DSHClient
         private void OnTrayDoubleClick(object sender, MouseEventArgs e)
         {
             if (e.Button != MouseButtons.Left) return;
-            if (NetUtil.PortOpen(_cfg.port)) NetUtil.OpenBrowser(_cfg.Url());
-            else _app.Start();
+            // 双击托盘：显示客户端主窗口（服务未运行则顺带启动）
+            ShowWindow();
+            if (!NetUtil.PortOpen(_cfg.port)) _app.Start();
         }
 
         private void ShowWindow()
