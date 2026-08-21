@@ -301,6 +301,28 @@ namespace DSHClient
             return null;
         }
 
+        // 查找 git（常见安装位置 + PATH）
+        public static string FindGit()
+        {
+            string[] cands = {
+                @"C:\Program Files\Git\cmd\git.exe",
+                @"C:\Program Files\Git\bin\git.exe",
+                @"C:\Program Files (x86)\Git\cmd\git.exe"
+            };
+            foreach (string c in cands) { try { if (File.Exists(c)) return c; } catch { } }
+            string path = Environment.GetEnvironmentVariable("PATH");
+            if (!string.IsNullOrEmpty(path))
+            {
+                foreach (string dir in path.Split(';'))
+                {
+                    string d = dir.Trim();
+                    if (d.Length == 0) continue;
+                    try { string p = Path.Combine(d, "git.exe"); if (File.Exists(p)) return p; } catch { }
+                }
+            }
+            return null;
+        }
+
         // 把 %环境变量% 和 ~（用户主目录）展开为实际路径
         public static string ExpandPath(string p)
         {
@@ -1800,20 +1822,9 @@ namespace DSHClient
         {
             try
             {
-                // 0) 环境检查
-                SetStep("检查环境…", 2);
-                List<string> missing = new List<string>();
-                if (!CheckTool(_cfg.ResolvedNodePath, "--version")) missing.Add("node.js");
-                if (!CheckTool("git", "--version")) missing.Add("git");
-                if (!CheckTool("cmd.exe", "/c pnpm --version")) missing.Add("pnpm");
-                if (missing.Count > 0)
-                {
-                    AppendOutput("> 缺少依赖：" + string.Join("、", missing.ToArray()) + "\r\n");
-                    AppendOutput("> 请先安装这些依赖（node / git 安装后重启客户端）再试。\r\n");
-                    Finish(false, "缺少依赖：" + string.Join("、", missing.ToArray()));
-                    return;
-                }
-                AppendOutput("> 环境检查通过（node / git / pnpm）\r\n");
+                // 0) 前置条件检查：node + git + pnpm，缺失可自动安装
+                SetStep("检查环境（node / git / pnpm）…", 2);
+                if (!EnsurePrereqs()) return;
 
                 // 1) 目录准备与克隆
                 SetStep("准备目录…", 8);
@@ -1839,7 +1850,7 @@ namespace DSHClient
                         }
                     }
                     SetStep("克隆仓库（首次较慢）…", 15);
-                    if (!RunStep("git clone --depth 1 " + url, "git",
+                    if (!RunStep("git clone --depth 1 " + url, Config.FindGit(),
                         "clone --depth 1 \"" + url + "\" \"" + dir + "\"", parent))
                     {
                         Finish(false, "克隆仓库失败（检查网络/地址）");
@@ -1850,7 +1861,7 @@ namespace DSHClient
                 // 2) pnpm install
                 if (_cancelled) return;
                 SetStep("安装依赖（pnpm install，较慢）…", 45);
-                if (!RunStep("pnpm install", "cmd.exe", "/c pnpm install", dir))
+                if (!RunStep("pnpm install", "cmd.exe", "/c \"\"" + FindPnpm() + "\" install\"", dir))
                 {
                     Finish(false, "安装依赖失败");
                     return;
@@ -1859,7 +1870,7 @@ namespace DSHClient
                 // 3) pnpm run build
                 if (_cancelled) return;
                 SetStep("构建产物（pnpm run build，较慢）…", 75);
-                if (!RunStep("pnpm run build", "cmd.exe", "/c pnpm run build", dir))
+                if (!RunStep("pnpm run build", "cmd.exe", "/c \"\"" + FindPnpm() + "\" run build\"", dir))
                 {
                     Finish(false, "构建失败（可查看上方输出）");
                     return;
@@ -1880,22 +1891,199 @@ namespace DSHClient
             }
         }
 
-        private bool CheckTool(string exe, string args)
+        // 前置条件检测：node + git + pnpm；缺失时询问是否自动安装，是则装完自动复检，否则退出安装
+        private bool EnsurePrereqs()
+        {
+            List<string> missing = new List<string>();
+            if (string.IsNullOrEmpty(Config.FindNode())) missing.Add("node.js");
+            if (string.IsNullOrEmpty(Config.FindGit())) missing.Add("git");
+            if (string.IsNullOrEmpty(FindPnpm())) missing.Add("pnpm");
+            if (missing.Count == 0)
+            {
+                AppendOutput("> 环境检查通过（node / git / pnpm）\r\n");
+                return true;
+            }
+
+            bool autoInstall = false;
+            try
+            {
+                this.Invoke((Action)delegate
+                {
+                    DialogResult r = MessageBox.Show(this,
+                        "缺少以下前置环境：\n\n" + string.Join("\n", missing.ToArray()) +
+                        "\n\n是否自动安装？\n（安装过程中如弹出「用户账户控制」窗口，请点击「是」）",
+                        "安装 DSH", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    autoInstall = (r == DialogResult.Yes);
+                });
+            }
+            catch { return false; }
+
+            if (!autoInstall)
+            {
+                // 否：退出 DSH 安装
+                AppendOutput("> 缺少前置环境（" + string.Join("、", missing.ToArray()) + "），已取消安装。\r\n");
+                try
+                {
+                    this.Invoke((Action)delegate
+                    {
+                        MessageBox.Show(this,
+                            "缺少前置环境（" + string.Join("、", missing.ToArray()) + "），已取消安装。\n安装好环境后重新打开本向导即可。",
+                            "安装 DSH", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        this.Close();
+                    });
+                }
+                catch { }
+                return false;
+            }
+
+            // 是：逐个自动安装，装完自动复检
+            AppendOutput("> 开始自动安装缺失环境…\r\n");
+            if (string.IsNullOrEmpty(Config.FindNode()))
+            {
+                if (!InstallWinget("OpenJS.NodeJS.LTS", "node.js")) return false;
+            }
+            if (string.IsNullOrEmpty(Config.FindGit()))
+            {
+                if (!InstallWinget("Git.Git", "git")) return false;
+            }
+            if (string.IsNullOrEmpty(FindPnpm()))
+            {
+                if (!InstallPnpm()) return false;
+            }
+
+            AppendOutput("> 自动安装完成，重新检测…\r\n");
+            List<string> stillMissing = new List<string>();
+            if (string.IsNullOrEmpty(Config.FindNode())) stillMissing.Add("node.js");
+            if (string.IsNullOrEmpty(Config.FindGit())) stillMissing.Add("git");
+            if (string.IsNullOrEmpty(FindPnpm())) stillMissing.Add("pnpm");
+            if (stillMissing.Count > 0)
+            {
+                Finish(false, "以下环境仍未检测到：" + string.Join("、", stillMissing.ToArray()) +
+                    "\n可能原因：安装被取消、需要重启客户端或注销后生效。请手动安装后重试。");
+                return false;
+            }
+            AppendOutput("> 环境就绪（node / git / pnpm）\r\n");
+            return true;
+        }
+
+        // 用 winget 自动安装；找不到 winget 则打开官方下载页
+        private bool InstallWinget(string id, string display)
+        {
+            string winget = FindWinget();
+            if (string.IsNullOrEmpty(winget))
+            {
+                Finish(false, "未检测到 winget，无法自动安装 " + display + "。\n将打开官方下载页，请手动安装后重试。");
+                NetUtil.OpenBrowser(display == "node.js" ? "https://nodejs.org/zh-cn/download" : "https://git-scm.com/download/win");
+                return false;
+            }
+            AppendOutput("\r\n=== 自动安装 " + display + "（winget）===\r\n");
+            bool ok = RunStep("安装 " + display, winget,
+                "install --id " + id + " -e --accept-source-agreements --accept-package-agreements --silent --disable-interactivity",
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+            if (!ok)
+            {
+                Finish(false, display + " 自动安装失败，请手动安装后重试。");
+                return false;
+            }
+            return true;
+        }
+
+        // 用 npm 全局安装 pnpm（node 自带 npm）
+        private bool InstallPnpm()
+        {
+            string npm = FindNpm();
+            if (string.IsNullOrEmpty(npm))
+            {
+                Finish(false, "未找到 npm（node 自带），无法自动安装 pnpm，请手动执行 npm install -g pnpm 后重试。");
+                return false;
+            }
+            AppendOutput("\r\n=== 自动安装 pnpm（npm install -g pnpm）===\r\n");
+            bool ok = RunStep("安装 pnpm", "cmd.exe", "/c \"\"" + npm + "\" install -g pnpm\"",
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+            if (!ok)
+            {
+                Finish(false, "pnpm 自动安装失败，请手动执行 npm install -g pnpm 后重试。");
+                return false;
+            }
+            return true;
+        }
+
+        // 查找 pnpm（常见位置 + PATH）
+        private string FindPnpm()
         {
             try
             {
-                Process p = new Process();
-                p.StartInfo.FileName = exe;
-                p.StartInfo.Arguments = args;
-                p.StartInfo.UseShellExecute = false;
-                p.StartInfo.CreateNoWindow = true;
-                p.StartInfo.RedirectStandardOutput = true;
-                p.StartInfo.RedirectStandardError = true;
-                p.Start();
-                p.WaitForExit(15000);
-                return p.ExitCode == 0;
+                string[] cands = {
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm", "pnpm.CMD"),
+                    @"C:\Program Files\nodejs\pnpm.CMD",
+                    @"D:\Program Files\nodejs\pnpm.CMD"
+                };
+                foreach (string c in cands) { try { if (File.Exists(c)) return c; } catch { } }
+                string path = Environment.GetEnvironmentVariable("PATH");
+                if (!string.IsNullOrEmpty(path))
+                {
+                    foreach (string dir in path.Split(';'))
+                    {
+                        string d = dir.Trim();
+                        if (d.Length == 0) continue;
+                        try
+                        {
+                            if (File.Exists(Path.Combine(d, "pnpm.CMD"))) return Path.Combine(d, "pnpm.CMD");
+                            if (File.Exists(Path.Combine(d, "pnpm.exe"))) return Path.Combine(d, "pnpm.exe");
+                        }
+                        catch { }
+                    }
+                }
             }
-            catch { return false; }
+            catch { }
+            return null;
+        }
+
+        private string FindWinget()
+        {
+            try
+            {
+                string p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Microsoft\\WindowsApps\\winget.exe");
+                if (File.Exists(p)) return p;
+                string path = Environment.GetEnvironmentVariable("PATH");
+                if (!string.IsNullOrEmpty(path))
+                {
+                    foreach (string dir in path.Split(';'))
+                    {
+                        string d = dir.Trim();
+                        if (d.Length == 0) continue;
+                        try { string f = Path.Combine(d, "winget.exe"); if (File.Exists(f)) return f; } catch { }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private string FindNpm()
+        {
+            try
+            {
+                string[] cands = {
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm", "npm.CMD"),
+                    @"C:\Program Files\nodejs\npm.cmd",
+                    @"D:\Program Files\nodejs\npm.cmd"
+                };
+                foreach (string c in cands) { try { if (File.Exists(c)) return c; } catch { } }
+                string path = Environment.GetEnvironmentVariable("PATH");
+                if (!string.IsNullOrEmpty(path))
+                {
+                    foreach (string dir in path.Split(';'))
+                    {
+                        string d = dir.Trim();
+                        if (d.Length == 0) continue;
+                        try { string f = Path.Combine(d, "npm.cmd"); if (File.Exists(f)) return f; } catch { }
+                    }
+                }
+            }
+            catch { }
+            return null;
         }
 
         private bool RunStep(string name, string fileName, string args, string workDir)
@@ -1997,6 +2185,7 @@ namespace DSHClient
                     home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
                 string pf = Path.Combine(home, "profiles", "web");
                 lines.Add("pluginProfile=" + pf + " exists=" + Directory.Exists(pf));
+                lines.Add("git=" + (Config.FindGit() ?? "(未找到)"));
                 string key = BalanceChecker.GetApiKey(cfg);
                 lines.Add("apiKey=" + (string.IsNullOrEmpty(key) ? "(无)" : "已配置(长度 " + key.Length.ToString() + ")"));
                 if (!string.IsNullOrEmpty(key))
