@@ -867,7 +867,7 @@ namespace DSHClient
             bPlugin.Size = new Size(88, 32);
             bPlugin.Click += delegate
             {
-                if (_pluginForm == null || _pluginForm.IsDisposed) _pluginForm = new PluginForm(_cfg);
+                if (_pluginForm == null || _pluginForm.IsDisposed) _pluginForm = new PluginForm(_cfg, _app);
                 _pluginForm.Show();
                 _pluginForm.Activate();
             };
@@ -1255,10 +1255,12 @@ namespace DSHClient
     internal class PluginForm : Form
     {
         private readonly Config _cfg;
+        private readonly App _app;
         private readonly TextBox _tSpec;
         private readonly TextBox _tOutput;
-        private readonly Label _lblInstalled;
+        private readonly ListBox _lstPlugins;
         private readonly Button _btnInstall;
+        private readonly List<string> _installedNames = new List<string>();
         private bool _busy;
 
         public string ProfileDir
@@ -1272,11 +1274,12 @@ namespace DSHClient
             }
         }
 
-        public PluginForm(Config cfg)
+        public PluginForm(Config cfg, App app)
         {
             _cfg = cfg;
+            _app = app;
             this.Text = "插件管理";
-            this.ClientSize = new Size(720, 520);
+            this.ClientSize = new Size(760, 528);
             this.StartPosition = FormStartPosition.CenterParent;
             this.Font = new Font("Microsoft YaHei UI", 9F);
 
@@ -1294,18 +1297,22 @@ namespace DSHClient
             };
 
             Label l2 = new Label();
-            l2.Text = "支持 github:用户/仓库、npm 包名、本地目录；Git 插件若被 pnpm 阻止构建脚本，会自动加许可并重试";
+            l2.Text = "支持 github:用户/仓库、npm 包名、本地目录；Git 插件若被 pnpm 阻止构建脚本会自动加许可重试；装坏了可选中卸载后「重启服务」";
             l2.Location = new Point(14, 42); l2.AutoSize = true; l2.ForeColor = Color.DimGray;
 
             _btnInstall = new Button(); _btnInstall.Text = "安装插件"; _btnInstall.Location = new Point(14, 66); _btnInstall.Size = new Size(96, 30);
             _btnInstall.Click += delegate { Install(); };
-            Button bOpenDir = new Button(); bOpenDir.Text = "打开插件目录"; bOpenDir.Location = new Point(116, 66); bOpenDir.Size = new Size(110, 30);
+            Button bUninstall = new Button(); bUninstall.Text = "卸载选中"; bUninstall.Location = new Point(116, 66); bUninstall.Size = new Size(96, 30);
+            bUninstall.Click += delegate { Uninstall(); };
+            Button bRestart = new Button(); bRestart.Text = "重启服务"; bRestart.Location = new Point(218, 66); bRestart.Size = new Size(96, 30);
+            bRestart.Click += delegate { RestartService(); };
+            Button bOpenDir = new Button(); bOpenDir.Text = "打开插件目录"; bOpenDir.Location = new Point(320, 66); bOpenDir.Size = new Size(110, 30);
             bOpenDir.Click += delegate
             {
                 if (Directory.Exists(ProfileDir)) NetUtil.OpenBrowser(ProfileDir);
                 else MessageBox.Show("profile 目录还不存在。", "插件管理");
             };
-            Button bOpenCfg = new Button(); bOpenCfg.Text = "打开 pnpm-workspace.yaml"; bOpenCfg.Location = new Point(232, 66); bOpenCfg.Size = new Size(176, 30);
+            Button bOpenCfg = new Button(); bOpenCfg.Text = "打开 pnpm-workspace.yaml"; bOpenCfg.Location = new Point(436, 66); bOpenCfg.Size = new Size(176, 30);
             bOpenCfg.Click += delegate
             {
                 string f = Path.Combine(ProfileDir, "pnpm-workspace.yaml");
@@ -1313,17 +1320,19 @@ namespace DSHClient
                 else MessageBox.Show("配置文件还不存在：" + f, "插件管理");
             };
 
-            _lblInstalled = new Label(); _lblInstalled.Location = new Point(14, 106); _lblInstalled.Size = new Size(692, 56);
-            _lblInstalled.Text = "已安装插件：";
+            Label l3 = new Label(); l3.Text = "已安装（选中后可卸载，双击也可）："; l3.Location = new Point(14, 104); l3.AutoSize = true;
+            _lstPlugins = new ListBox(); _lstPlugins.Location = new Point(14, 126); _lstPlugins.Size = new Size(732, 86);
+            _lstPlugins.Font = new Font("Microsoft YaHei UI", 9F);
+            _lstPlugins.DoubleClick += delegate { Uninstall(); };
 
-            _tOutput = new TextBox(); _tOutput.Location = new Point(14, 166); _tOutput.Size = new Size(692, 340);
+            _tOutput = new TextBox(); _tOutput.Location = new Point(14, 220); _tOutput.Size = new Size(732, 296);
             _tOutput.Multiline = true; _tOutput.ReadOnly = true; _tOutput.ScrollBars = ScrollBars.Both;
             _tOutput.WordWrap = false; _tOutput.Font = new Font("Consolas", 9F);
 
             Controls.Add(l1); Controls.Add(_tSpec); Controls.Add(bBrowse);
             Controls.Add(l2);
-            Controls.Add(_btnInstall); Controls.Add(bOpenDir); Controls.Add(bOpenCfg);
-            Controls.Add(_lblInstalled);
+            Controls.Add(_btnInstall); Controls.Add(bUninstall); Controls.Add(bRestart); Controls.Add(bOpenDir); Controls.Add(bOpenCfg);
+            Controls.Add(l3); Controls.Add(_lstPlugins);
             Controls.Add(_tOutput);
 
             RefreshInstalled();
@@ -1331,8 +1340,8 @@ namespace DSHClient
 
         private void RefreshInstalled()
         {
-            StringBuilder sb = new StringBuilder();
-            sb.Append("已安装插件：");
+            _installedNames.Clear();
+            _lstPlugins.Items.Clear();
             try
             {
                 string pf = Path.Combine(ProfileDir, "package.json");
@@ -1341,6 +1350,7 @@ namespace DSHClient
                     JavaScriptSerializer ser = new JavaScriptSerializer();
                     Dictionary<string, object> d = ser.Deserialize<Dictionary<string, object>>(
                         File.ReadAllText(pf, Encoding.UTF8));
+                    List<string> bundles = new List<string>();
                     if (d != null)
                     {
                         Dictionary<string, object> dd = d["dsh"] as Dictionary<string, object>;
@@ -1352,8 +1362,7 @@ namespace DSHClient
                                 System.Collections.IEnumerable arr = dp["bundles"] as System.Collections.IEnumerable;
                                 if (arr != null)
                                 {
-                                    foreach (object o in arr)
-                                        sb.Append("\n  ● " + o.ToString() + "（配置层）");
+                                    foreach (object o in arr) bundles.Add(o.ToString());
                                 }
                             }
                         }
@@ -1361,15 +1370,27 @@ namespace DSHClient
                         if (deps != null && deps.Count > 0)
                         {
                             foreach (KeyValuePair<string, object> kv in deps)
-                                sb.Append("\n  • " + kv.Key + "（" + kv.Value + "）");
+                            {
+                                _installedNames.Add(kv.Key);
+                                _lstPlugins.Items.Add((bundles.Contains(kv.Key) ? "● " : "• ") +
+                                    kv.Key + "（" + kv.Value + "）" +
+                                    (bundles.Contains(kv.Key) ? "  配置层" : "  普通依赖"));
+                            }
                         }
                     }
-                    if (sb.Length < 8) sb.Append("\n  （暂无，点「安装插件」添加）");
+                    if (_lstPlugins.Items.Count == 0)
+                        _lstPlugins.Items.Add("（暂无已安装插件，点「安装插件」添加）");
                 }
-                else sb.Append("\n  profile 尚未初始化（首次安装会自动创建）");
+                else
+                {
+                    _lstPlugins.Items.Add("（profile 尚未初始化，首次安装会自动创建）");
+                }
             }
-            catch { }
-            _lblInstalled.Text = sb.ToString();
+            catch
+            {
+                _lstPlugins.Items.Clear();
+                _lstPlugins.Items.Add("（读取 package.json 失败）");
+            }
         }
 
         private void AppendOutput(string text)
@@ -1394,6 +1415,30 @@ namespace DSHClient
         {
             if (_busy) return;
             if (string.IsNullOrEmpty(spec)) { MessageBox.Show("请先填写插件地址。", "插件管理"); return; }
+            RunCommand("add", spec);
+        }
+
+        private void Uninstall()
+        {
+            if (_busy) return;
+            int idx = _lstPlugins.SelectedIndex;
+            if (idx < 0 || idx >= _installedNames.Count)
+            {
+                MessageBox.Show("请先在列表中选择要卸载的插件（双击也可）。", "插件管理");
+                return;
+            }
+            string name = _installedNames[idx];
+            DialogResult r = MessageBox.Show(this,
+                "确定卸载插件：" + name + "？\n\n卸载后其配置层也会从 profile 中移除。",
+                "插件管理", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r != DialogResult.Yes) return;
+            RunCommand("remove", name);
+        }
+
+        // 通用执行：dsh plugin --profile web <verb> <arg>
+        private void RunCommand(string verb, string arg)
+        {
+            if (_busy) return;
             string checkout = _cfg.ResolvedCheckoutPath;
             string node = _cfg.ResolvedNodePath;
             if (string.IsNullOrEmpty(checkout) || !Directory.Exists(checkout))
@@ -1404,10 +1449,10 @@ namespace DSHClient
             _busy = true;
             _btnInstall.Enabled = false;
             _tOutput.Clear();
-            AppendOutput("> dsh plugin --profile web add " + spec + "\r\n");
+            AppendOutput("> dsh plugin --profile web " + verb + " " + arg + "\r\n");
 
-            string args = "--import tsx/esm apps/cli/src/bin.ts plugin --profile web add \"" +
-                spec.Replace("\"", "\\\"") + "\"";
+            string args = "--import tsx/esm apps/cli/src/bin.ts plugin --profile web " + verb +
+                " \"" + arg.Replace("\"", "\\\"") + "\"";
             Process p = new Process();
             p.StartInfo.FileName = node;
             p.StartInfo.Arguments = args;
@@ -1437,8 +1482,10 @@ namespace DSHClient
                 AppendOutput("\r\n> 退出码: " + code.ToString() + "\r\n");
                 if (code == 0)
                 {
-                    try { this.Invoke((Action)delegate { RefreshInstalled(); }); } catch { }
-                    AppendOutput("> 安装完成。若 DSH Web 正在运行，请「停止服务」后重新「启动服务」使插件层生效。\r\n");
+                    string doneMsg = verb == "remove"
+                        ? "已卸载插件 " + arg + "。"
+                        : "插件 " + arg + " 安装完成。";
+                    try { this.Invoke((Action)delegate { RefreshInstalled(); AskRestart(doneMsg); }); } catch { }
                 }
                 else
                 {
@@ -1446,11 +1493,11 @@ namespace DSHClient
                     lock (capLock) all = captured.ToString();
                     if (LooksLikeBuildBlock(all))
                     {
-                        try { this.Invoke((Action)delegate { HandleBuildBlock(all, spec); }); } catch { }
+                        try { this.Invoke((Action)delegate { HandleBuildBlock(all, arg); }); } catch { }
                     }
                     else
                     {
-                        AppendOutput("> 安装失败，请根据上方输出排查（可点「打开 pnpm-workspace.yaml」检查配置）。\r\n");
+                        AppendOutput("> 操作失败，请根据上方输出排查（可点「打开 pnpm-workspace.yaml」检查配置）。\r\n");
                     }
                 }
             };
@@ -1466,6 +1513,34 @@ namespace DSHClient
                 _busy = false;
                 _btnInstall.Enabled = true;
                 AppendOutput("> 启动失败: " + ex.Message + "\r\n");
+            }
+        }
+
+        // 装/卸成功后询问是否重启服务使配置生效
+        private void AskRestart(string what)
+        {
+            DialogResult r = MessageBox.Show(this,
+                what + "\n\n是否立即重启服务使插件配置生效？",
+                "插件管理", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r == DialogResult.Yes) RestartService();
+        }
+
+        // 停止并重启 DSH Web 服务（插件层在下次启动时生效）
+        private void RestartService()
+        {
+            try
+            {
+                _btnInstall.Enabled = false;
+                AppendOutput("> 正在停止并重启服务…\r\n");
+                _app.Stop();
+                _app.Start();
+                AppendOutput("> 服务已重启，插件配置已生效。\r\n");
+                _btnInstall.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                AppendOutput("> 重启失败：" + ex.Message + "\r\n");
+                _btnInstall.Enabled = true;
             }
         }
 
