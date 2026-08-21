@@ -13,6 +13,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -113,11 +114,17 @@ namespace DSHClient
 
     internal class Config
     {
-        public string checkoutPath = "H:\\DeepseekHarness\\deepseek-harness";
+        // 路径支持 %环境变量% 和 ~（用户主目录）；留空则自动检测
+        public string checkoutPath = "";
         public string nodePath = "";
         public int port = 3080;
         public bool autoOpenBrowser = true;
         public bool minimizeToTray = true;
+        // 高峰期时段（小时 0-23，跨天也支持），其余时间为空闲期
+        public int peakStartHour = 9;
+        public int peakEndHour = 23;
+        // DeepSeek API Key（留空则读取 DEEPSEEK_API_KEY 环境变量或 DSH 的 .credentials.yaml）
+        public string apiKey = "";
 
         public string Dir = "";
         public string ConfigFile { get { return Path.Combine(Dir, "config.json"); } }
@@ -141,21 +148,22 @@ namespace DSHClient
                     if (d != null)
                     {
                         string s = GetStr(d, "checkoutPath", null);
-                        if (!string.IsNullOrEmpty(s)) c.checkoutPath = s;
+                        if (s != null) c.checkoutPath = s;
                         int p = GetInt(d, "port", 0);
                         if (p > 0 && p < 65536) c.port = p;
                         s = GetStr(d, "nodePath", null);
-                        if (!string.IsNullOrEmpty(s) && File.Exists(s)) c.nodePath = s;
+                        if (s != null) c.nodePath = s;
                         c.autoOpenBrowser = GetBool(d, "autoOpenBrowser", c.autoOpenBrowser);
                         c.minimizeToTray = GetBool(d, "minimizeToTray", c.minimizeToTray);
+                        int ph = GetInt(d, "peakStartHour", -1);
+                        if (ph >= 0 && ph <= 23) c.peakStartHour = ph;
+                        ph = GetInt(d, "peakEndHour", -1);
+                        if (ph >= 0 && ph <= 23) c.peakEndHour = ph;
+                        s = GetStr(d, "apiKey", null);
+                        if (!string.IsNullOrEmpty(s)) c.apiKey = s;
                     }
                 }
                 catch { }
-            }
-            if (string.IsNullOrEmpty(c.nodePath))
-            {
-                string n = FindNode();
-                if (n != null) c.nodePath = n;
             }
             return c;
         }
@@ -168,6 +176,9 @@ namespace DSHClient
             d["port"] = port;
             d["autoOpenBrowser"] = autoOpenBrowser;
             d["minimizeToTray"] = minimizeToTray;
+            d["peakStartHour"] = peakStartHour;
+            d["peakEndHour"] = peakEndHour;
+            d["apiKey"] = apiKey;
             try
             {
                 JavaScriptSerializer ser = new JavaScriptSerializer();
@@ -214,6 +225,105 @@ namespace DSHClient
                 }
             }
             return null;
+        }
+
+        // 把 %环境变量% 和 ~（用户主目录）展开为实际路径
+        public static string ExpandPath(string p)
+        {
+            if (string.IsNullOrEmpty(p)) return p;
+            p = p.Trim();
+            if (p == "~")
+                return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (p.StartsWith("~\\") || p.StartsWith("~/"))
+                p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    p.Substring(2).TrimStart('\\', '/'));
+            int i = p.IndexOf('%');
+            int guard = 0;
+            while (i >= 0 && guard++ < 16)
+            {
+                int j = p.IndexOf('%', i + 1);
+                if (j < 0) break;
+                string var = p.Substring(i + 1, j - i - 1);
+                string val = Environment.GetEnvironmentVariable(var);
+                if (val == null) break;
+                p = p.Substring(0, i) + val + p.Substring(j + 1);
+                i = p.IndexOf('%');
+            }
+            return p;
+        }
+
+        // 解析后的实际路径（支持环境变量 / ~ / 留空自动检测）
+        public string ResolvedCheckoutPath
+        {
+            get
+            {
+                string p = ExpandPath(checkoutPath);
+                if (string.IsNullOrEmpty(p)) p = FindCheckout();
+                return p;
+            }
+        }
+
+        public string ResolvedNodePath
+        {
+            get
+            {
+                string p = ExpandPath(nodePath);
+                if (string.IsNullOrEmpty(p)) p = FindNode();
+                return p;
+            }
+        }
+
+        // 自动检测 DSH 仓库目录（环境变量 DSH_CHECKOUT_PATH 优先，再试常见位置）
+        public static string FindCheckout()
+        {
+            try
+            {
+                string env = Environment.GetEnvironmentVariable("DSH_CHECKOUT_PATH");
+                if (!string.IsNullOrEmpty(env) &&
+                    File.Exists(Path.Combine(env, "apps\\cli\\src\\bin.ts"))) return env;
+                string[] cands = {
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "deepseek-harness"),
+                    @"C:\deepseek-harness",
+                    @"D:\deepseek-harness",
+                    @"H:\deepseek-harness"
+                };
+                foreach (string c in cands)
+                {
+                    try
+                    {
+                        if (File.Exists(Path.Combine(c, "apps\\cli\\src\\bin.ts"))) return c;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // ---- 高峰期 / 空闲期 ----
+        public bool IsPeakNow()
+        {
+            int hour = DateTime.Now.Hour;
+            int s = peakStartHour, e = peakEndHour;
+            if (s == e) return false;
+            if (s < e) return hour >= s && hour < e;
+            return hour >= s || hour < e; // 跨天（如 22 点-次日 6 点）
+        }
+
+        public string CurrentPeriodName() { return IsPeakNow() ? "高峰期" : "空闲期"; }
+        public string NextPeriodName() { return IsPeakNow() ? "空闲期" : "高峰期"; }
+
+        public DateTime NextTransition()
+        {
+            if (IsPeakNow())
+            {
+                DateTime n = DateTime.Today.AddHours(peakEndHour);
+                if (n <= DateTime.Now) n = n.AddDays(1);
+                return n;
+            }
+            DateTime m = DateTime.Today.AddHours(peakStartHour);
+            if (m <= DateTime.Now) m = m.AddDays(1);
+            return m;
         }
     }
 
@@ -275,6 +385,84 @@ namespace DSHClient
         }
     }
 
+    internal static class BalanceChecker
+    {
+        // 查找 DeepSeek API Key：设置里填的 > 环境变量 > DSH 的 .credentials.yaml
+        public static string GetApiKey(Config cfg)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(cfg.apiKey)) return cfg.apiKey.Trim();
+                string k = Environment.GetEnvironmentVariable("DEEPSEEK_API_KEY");
+                if (!string.IsNullOrEmpty(k)) return k.Trim();
+                string home = Environment.GetEnvironmentVariable("DSH_HOME");
+                if (string.IsNullOrEmpty(home))
+                    home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
+                string yaml = Path.Combine(home, ".credentials.yaml");
+                if (File.Exists(yaml))
+                {
+                    foreach (string line in File.ReadAllLines(yaml))
+                    {
+                        int idx = line.IndexOf(':');
+                        if (idx < 0) continue;
+                        string key = line.Substring(0, idx).Trim();
+                        string val = line.Substring(idx + 1).Trim().Trim('"', '\'');
+                        if (key.Equals("deepseek_api_key", StringComparison.OrdinalIgnoreCase) ||
+                            key.Equals("api_key", StringComparison.OrdinalIgnoreCase))
+                            return val;
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // 查询余额，返回如 "¥110.00" 或错误说明
+        public static string Query(string apiKey)
+        {
+            try
+            {
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create("https://api.deepseek.com/user/balance");
+                req.Method = "GET";
+                req.Headers["Authorization"] = "Bearer " + apiKey;
+                req.Accept = "application/json";
+                req.Timeout = 10000;
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                {
+                    using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    {
+                        string json = sr.ReadToEnd();
+                        JavaScriptSerializer ser = new JavaScriptSerializer();
+                        Dictionary<string, object> d = ser.Deserialize<Dictionary<string, object>>(json);
+                        if (d != null && d.ContainsKey("balance_infos"))
+                        {
+                            object[] arr = d["balance_infos"] as object[];
+                            if (arr != null && arr.Length > 0)
+                            {
+                                Dictionary<string, object> info = arr[0] as Dictionary<string, object>;
+                                if (info != null)
+                                {
+                                    string currency = info.ContainsKey("currency") ? info["currency"].ToString() : "CNY";
+                                    string total = info.ContainsKey("total_balance") ? info["total_balance"].ToString() : "0";
+                                    string sym = currency == "CNY" ? "¥" : (currency == "USD" ? "$" : currency + " ");
+                                    return sym + total;
+                                }
+                            }
+                        }
+                        return "未知响应";
+                    }
+                }
+            }
+            catch (WebException ex)
+            {
+                HttpWebResponse r = ex.Response as HttpWebResponse;
+                if (r != null && r.StatusCode == HttpStatusCode.Unauthorized) return "API Key 无效";
+                return "请求失败";
+            }
+            catch { return "请求失败"; }
+        }
+    }
+
     internal class App
     {
         public Config Config;
@@ -291,15 +479,20 @@ namespace DSHClient
             if (NetUtil.PortOpen(Config.port)) { NetUtil.OpenBrowser(Config.Url()); return; }
             if (ServerAlive) return;
 
-            if (!Directory.Exists(Config.checkoutPath))
+            string checkout = Config.ResolvedCheckoutPath;
+            string node = Config.ResolvedNodePath;
+
+            if (string.IsNullOrEmpty(checkout) || !Directory.Exists(checkout))
             {
-                MessageBox.Show("找不到 DSH 仓库目录：\n" + Config.checkoutPath + "\n\n请在「设置」中修改。",
+                MessageBox.Show("找不到 DSH 仓库目录：\n" + (string.IsNullOrEmpty(checkout) ? "(未设置)" : checkout) +
+                    "\n\n请在「设置」中填写，或点击「自动检测」。",
                     "DSH 客户端", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            if (!File.Exists(Config.nodePath))
+            if (string.IsNullOrEmpty(node) || !File.Exists(node))
             {
-                MessageBox.Show("找不到 node.exe：\n" + Config.nodePath + "\n\n请在「设置」中修改。",
+                MessageBox.Show("找不到 node.exe：\n" + (string.IsNullOrEmpty(node) ? "(未设置)" : node) +
+                    "\n\n请在「设置」中填写，或点击「自动检测」。",
                     "DSH 客户端", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
@@ -308,9 +501,9 @@ namespace DSHClient
                 Directory.CreateDirectory(Config.Dir);
                 Directory.CreateDirectory(Config.LogDir);
                 ProcessStartInfo psi = new ProcessStartInfo();
-                psi.FileName = Config.nodePath;
+                psi.FileName = node;
                 psi.Arguments = "--import tsx/esm apps/cli/src/bin.ts web";
-                psi.WorkingDirectory = Config.checkoutPath;
+                psi.WorkingDirectory = checkout;
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
                 psi.RedirectStandardOutput = true;
@@ -330,7 +523,7 @@ namespace DSHClient
                 _server.BeginOutputReadLine();
                 _server.BeginErrorReadLine();
                 JustStarted = true;
-                WriteLog("[DSH] 正在启动: " + Config.nodePath + " --import tsx/esm apps/cli/src/bin.ts web (port " +
+                WriteLog("[DSH] 正在启动: " + node + " --import tsx/esm apps/cli/src/bin.ts web (port " +
                     Config.port.ToString() + ")");
             }
             catch (Exception ex)
@@ -417,9 +610,15 @@ namespace DSHClient
         private Icon _iconDown;
         private System.Threading.Thread _activateThread;
         private Label _lblStatus;
+        private Label _lblPeriod;
+        private Label _lblBalance;
         private Button _btnStart;
         private Button _btnStop;
         private Button _btnOpen;
+        private Button _btnBalance;
+        private DateTime _lastNotifiedTransition = DateTime.MinValue;
+        private DateTime _lastBalanceRefresh = DateTime.MinValue;
+        private bool _balanceLoading;
         private LogForm _logForm;
         private SettingsForm _settingsForm;
 
@@ -474,35 +673,55 @@ namespace DSHClient
         private void BuildUi()
         {
             this.Text = "DSH 客户端";
-            this.ClientSize = new Size(392, 168);
+            this.ClientSize = new Size(392, 206);
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
             this.Font = new Font("Microsoft YaHei UI", 9F);
 
             _lblStatus = new Label();
-            _lblStatus.Location = new Point(14, 16);
-            _lblStatus.Size = new Size(364, 26);
+            _lblStatus.Location = new Point(14, 14);
+            _lblStatus.Size = new Size(364, 24);
             _lblStatus.Text = "●";
             Controls.Add(_lblStatus);
 
+            _lblPeriod = new Label();
+            _lblPeriod.Location = new Point(14, 38);
+            _lblPeriod.Size = new Size(364, 22);
+            _lblPeriod.Text = "●";
+            _lblPeriod.ForeColor = Color.DodgerBlue;
+            Controls.Add(_lblPeriod);
+
+            _lblBalance = new Label();
+            _lblBalance.Location = new Point(14, 62);
+            _lblBalance.Size = new Size(318, 24);
+            _lblBalance.Text = "余额：查询中…";
+            Controls.Add(_lblBalance);
+
+            _btnBalance = new Button();
+            _btnBalance.Text = "刷新";
+            _btnBalance.Location = new Point(334, 60);
+            _btnBalance.Size = new Size(46, 26);
+            _btnBalance.Click += delegate { RefreshBalance(); };
+            Controls.Add(_btnBalance);
+
             _btnStart = new Button();
             _btnStart.Text = "启动服务";
-            _btnStart.Location = new Point(14, 58);
+            _btnStart.Location = new Point(14, 96);
             _btnStart.Size = new Size(88, 32);
             _btnStart.Click += delegate { _app.Start(); };
             Controls.Add(_btnStart);
 
             _btnStop = new Button();
             _btnStop.Text = "停止服务";
-            _btnStop.Location = new Point(108, 58);
+            _btnStop.Location = new Point(108, 96);
             _btnStop.Size = new Size(88, 32);
             _btnStop.Click += delegate { _app.Stop(); };
             Controls.Add(_btnStop);
 
             _btnOpen = new Button();
             _btnOpen.Text = "打开网页";
-            _btnOpen.Location = new Point(202, 58);
+            _btnOpen.Location = new Point(202, 96);
             _btnOpen.Size = new Size(88, 32);
             _btnOpen.Click += delegate
             {
@@ -513,7 +732,7 @@ namespace DSHClient
 
             Button bLog = new Button();
             bLog.Text = "查看日志";
-            bLog.Location = new Point(14, 104);
+            bLog.Location = new Point(14, 140);
             bLog.Size = new Size(88, 32);
             bLog.Click += delegate
             {
@@ -525,18 +744,19 @@ namespace DSHClient
 
             Button bSet = new Button();
             bSet.Text = "设置";
-            bSet.Location = new Point(108, 104);
+            bSet.Location = new Point(108, 140);
             bSet.Size = new Size(88, 32);
             bSet.Click += delegate
             {
                 if (_settingsForm == null || _settingsForm.IsDisposed) _settingsForm = new SettingsForm(_cfg);
                 _settingsForm.ShowDialog(this);
+                UpdatePeriod();
             };
             Controls.Add(bSet);
 
             Button bQuit = new Button();
             bQuit.Text = "退出";
-            bQuit.Location = new Point(296, 104);
+            bQuit.Location = new Point(296, 140);
             bQuit.Size = new Size(82, 32);
             bQuit.Click += delegate { _quitting = true; Application.Exit(); };
             Controls.Add(bQuit);
@@ -608,6 +828,11 @@ namespace DSHClient
                 }
             }
             UpdateUi(up);
+            UpdatePeriod();
+            if ((DateTime.Now - _lastBalanceRefresh).TotalSeconds >= 900 && !_balanceLoading)
+            {
+                RefreshBalance();
+            }
             if (up && _app.JustStarted && _cfg.autoOpenBrowser && !_openedAfterStart)
             {
                 _openedAfterStart = true;
@@ -615,6 +840,50 @@ namespace DSHClient
                 NetUtil.OpenBrowser(_cfg.Url());
                 _tray.ShowBalloonTip(3000, "DSH 客户端", "服务已就绪：" + _cfg.Url(), ToolTipIcon.Info);
             }
+        }
+
+        // 高峰期/空闲期显示 + 切换前 5 分钟 Windows 通知
+        private void UpdatePeriod()
+        {
+            TimeSpan remain = _cfg.NextTransition() - DateTime.Now;
+            _lblPeriod.Text = "● " + _cfg.CurrentPeriodName() + " · 距" + _cfg.NextPeriodName() +
+                "（" + _cfg.NextTransition().ToString("HH:mm") + "）还有 " + FormatRemain(remain);
+            if (remain.TotalMinutes > 0 && remain.TotalMinutes <= 5 &&
+                _lastNotifiedTransition < _cfg.NextTransition().AddMinutes(-6))
+            {
+                _lastNotifiedTransition = _cfg.NextTransition();
+                _tray.ShowBalloonTip(8000, "DSH 时段提醒",
+                    "当前" + _cfg.CurrentPeriodName() + "还剩 " + FormatRemain(remain) +
+                    "，即将在 " + _cfg.NextTransition().ToString("HH:mm") + " 切换到" + _cfg.NextPeriodName() + "。",
+                    ToolTipIcon.Info);
+            }
+        }
+
+        private static string FormatRemain(TimeSpan t)
+        {
+            if (t.TotalHours >= 1) return ((int)t.TotalHours).ToString() + "小时" + t.Minutes.ToString() + "分";
+            if (t.TotalMinutes >= 1) return t.Minutes.ToString() + "分";
+            return "不到1分钟";
+        }
+
+        // 查询并显示余额（后台线程，不卡界面）
+        private void RefreshBalance()
+        {
+            if (_balanceLoading) return;
+            _balanceLoading = true;
+            _lblBalance.Text = "余额：查询中…";
+            Thread t = new Thread(delegate()
+            {
+                string result;
+                string key = BalanceChecker.GetApiKey(_cfg);
+                if (string.IsNullOrEmpty(key)) result = "未配置 API Key（设置中可填，或自动读取 DSH 凭据）";
+                else result = BalanceChecker.Query(key);
+                _lastBalanceRefresh = DateTime.Now;
+                _balanceLoading = false;
+                try { this.Invoke((Action)delegate { _lblBalance.Text = "余额：" + result; }); } catch { }
+            });
+            t.IsBackground = true;
+            t.Start();
         }
 
         private void UpdateUi(bool up)
@@ -758,6 +1027,9 @@ namespace DSHClient
         private readonly TextBox _tCheckout;
         private readonly TextBox _tNode;
         private readonly TextBox _tPort;
+        private readonly TextBox _tPeakStart;
+        private readonly TextBox _tPeakEnd;
+        private readonly TextBox _tApiKey;
         private readonly CheckBox _cOpen;
         private readonly CheckBox _cTray;
 
@@ -765,29 +1037,58 @@ namespace DSHClient
         {
             _cfg = cfg;
             this.Text = "设置";
-            this.ClientSize = new Size(430, 258);
+            this.ClientSize = new Size(430, 366);
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.MinimizeBox = false;
             this.StartPosition = FormStartPosition.CenterParent;
             this.Font = new Font("Microsoft YaHei UI", 9F);
 
-            Label l1 = new Label(); l1.Text = "DSH 仓库目录："; l1.Location = new Point(16, 14); l1.AutoSize = true;
-            _tCheckout = new TextBox(); _tCheckout.Text = cfg.checkoutPath; _tCheckout.Location = new Point(16, 34); _tCheckout.Size = new Size(398, 23);
-            Label l2 = new Label(); l2.Text = "node.exe 路径："; l2.Location = new Point(16, 66); l2.AutoSize = true;
-            _tNode = new TextBox(); _tNode.Text = cfg.nodePath; _tNode.Location = new Point(16, 86); _tNode.Size = new Size(398, 23);
-            Label l3 = new Label(); l3.Text = "端口："; l3.Location = new Point(16, 118); l3.AutoSize = true;
-            _tPort = new TextBox(); _tPort.Text = cfg.port.ToString(); _tPort.Location = new Point(16, 138); _tPort.Size = new Size(70, 23);
-            _cOpen = new CheckBox(); _cOpen.Text = "服务就绪后自动打开浏览器"; _cOpen.Checked = cfg.autoOpenBrowser; _cOpen.Location = new Point(120, 140); _cOpen.AutoSize = true;
-            _cTray = new CheckBox(); _cTray.Text = "最小化时隐藏到系统托盘"; _cTray.Checked = cfg.minimizeToTray; _cTray.Location = new Point(16, 172); _cTray.AutoSize = true;
+            Label l1 = new Label(); l1.Text = "DSH 仓库目录（留空=自动检测，支持 %变量% 和 ~）："; l1.Location = new Point(16, 12); l1.AutoSize = true;
+            _tCheckout = new TextBox(); _tCheckout.Text = cfg.checkoutPath; _tCheckout.Location = new Point(16, 34); _tCheckout.Size = new Size(300, 23);
+            Button bDetectCheckout = new Button(); bDetectCheckout.Text = "自动检测"; bDetectCheckout.Location = new Point(322, 33); bDetectCheckout.Size = new Size(92, 25);
+            bDetectCheckout.Click += delegate
+            {
+                string f = Config.FindCheckout();
+                if (f != null) _tCheckout.Text = f;
+                else MessageBox.Show("未检测到，请手动填写。", "设置");
+            };
 
-            Button bOk = new Button(); bOk.Text = "保存"; bOk.DialogResult = DialogResult.OK; bOk.Location = new Point(234, 214); bOk.Size = new Size(90, 30);
+            Label l2 = new Label(); l2.Text = "node.exe 路径（留空=自动检测）："; l2.Location = new Point(16, 66); l2.AutoSize = true;
+            _tNode = new TextBox(); _tNode.Text = cfg.nodePath; _tNode.Location = new Point(16, 88); _tNode.Size = new Size(300, 23);
+            Button bDetectNode = new Button(); bDetectNode.Text = "自动检测"; bDetectNode.Location = new Point(322, 87); bDetectNode.Size = new Size(92, 25);
+            bDetectNode.Click += delegate
+            {
+                string f = Config.FindNode();
+                if (f != null) _tNode.Text = f;
+                else MessageBox.Show("未检测到，请手动填写。", "设置");
+            };
+
+            Label l3 = new Label(); l3.Text = "端口："; l3.Location = new Point(16, 120); l3.AutoSize = true;
+            _tPort = new TextBox(); _tPort.Text = cfg.port.ToString(); _tPort.Location = new Point(16, 140); _tPort.Size = new Size(70, 23);
+
+            Label l4 = new Label(); l4.Text = "高峰期时段（小时 0-23，支持跨天）："; l4.Location = new Point(16, 172); l4.AutoSize = true;
+            _tPeakStart = new TextBox(); _tPeakStart.Text = cfg.peakStartHour.ToString(); _tPeakStart.Location = new Point(16, 194); _tPeakStart.Size = new Size(50, 23);
+            Label l4b = new Label(); l4b.Text = "～"; l4b.Location = new Point(70, 196); l4b.AutoSize = true;
+            _tPeakEnd = new TextBox(); _tPeakEnd.Text = cfg.peakEndHour.ToString(); _tPeakEnd.Location = new Point(88, 194); _tPeakEnd.Size = new Size(50, 23);
+            Label l4c = new Label(); l4c.Text = "（其余时间为空闲期）"; l4c.Location = new Point(146, 196); l4c.AutoSize = true;
+
+            Label l5 = new Label(); l5.Text = "DeepSeek API Key（留空=读取环境变量或 DSH 凭据）："; l5.Location = new Point(16, 224); l5.AutoSize = true;
+            _tApiKey = new TextBox(); _tApiKey.Text = cfg.apiKey; _tApiKey.Location = new Point(16, 246); _tApiKey.Size = new Size(398, 23);
+            _tApiKey.UseSystemPasswordChar = true;
+
+            _cOpen = new CheckBox(); _cOpen.Text = "服务就绪后自动打开浏览器"; _cOpen.Checked = cfg.autoOpenBrowser; _cOpen.Location = new Point(16, 278); _cOpen.AutoSize = true;
+            _cTray = new CheckBox(); _cTray.Text = "最小化时隐藏到系统托盘"; _cTray.Checked = cfg.minimizeToTray; _cTray.Location = new Point(16, 300); _cTray.AutoSize = true;
+
+            Button bOk = new Button(); bOk.Text = "保存"; bOk.DialogResult = DialogResult.OK; bOk.Location = new Point(234, 326); bOk.Size = new Size(90, 30);
             bOk.Click += delegate { SaveAndClose(); };
-            Button bCancel = new Button(); bCancel.Text = "取消"; bCancel.DialogResult = DialogResult.Cancel; bCancel.Location = new Point(330, 214); bCancel.Size = new Size(90, 30);
+            Button bCancel = new Button(); bCancel.Text = "取消"; bCancel.DialogResult = DialogResult.Cancel; bCancel.Location = new Point(330, 326); bCancel.Size = new Size(90, 30);
 
-            Controls.Add(l1); Controls.Add(_tCheckout);
-            Controls.Add(l2); Controls.Add(_tNode);
+            Controls.Add(l1); Controls.Add(_tCheckout); Controls.Add(bDetectCheckout);
+            Controls.Add(l2); Controls.Add(_tNode); Controls.Add(bDetectNode);
             Controls.Add(l3); Controls.Add(_tPort);
+            Controls.Add(l4); Controls.Add(_tPeakStart); Controls.Add(l4b); Controls.Add(_tPeakEnd); Controls.Add(l4c);
+            Controls.Add(l5); Controls.Add(_tApiKey);
             Controls.Add(_cOpen); Controls.Add(_cTray);
             Controls.Add(bOk); Controls.Add(bCancel);
             AcceptButton = bOk;
@@ -802,6 +1103,10 @@ namespace DSHClient
             _cfg.nodePath = _tNode.Text.Trim();
             _cfg.autoOpenBrowser = _cOpen.Checked;
             _cfg.minimizeToTray = _cTray.Checked;
+            int h;
+            if (int.TryParse(_tPeakStart.Text.Trim(), out h) && h >= 0 && h <= 23) _cfg.peakStartHour = h;
+            if (int.TryParse(_tPeakEnd.Text.Trim(), out h) && h >= 0 && h <= 23) _cfg.peakEndHour = h;
+            _cfg.apiKey = _tApiKey.Text.Trim();
             _cfg.Save();
         }
     }
@@ -817,10 +1122,17 @@ namespace DSHClient
                 Config cfg = Config.Load(dir);
                 lines.Add("selftest start");
                 lines.Add("configFile=" + cfg.ConfigFile + " exists=" + File.Exists(cfg.ConfigFile));
-                lines.Add("checkoutPath=" + cfg.checkoutPath + " exists=" + Directory.Exists(cfg.checkoutPath));
-                lines.Add("nodePath=" + cfg.nodePath + " exists=" + File.Exists(cfg.nodePath));
+                lines.Add("checkoutPath(原始)=" + cfg.checkoutPath);
+                lines.Add("resolvedCheckout=" + (cfg.ResolvedCheckoutPath ?? "(未找到)") + " exists=" +
+                    (!string.IsNullOrEmpty(cfg.ResolvedCheckoutPath) && Directory.Exists(cfg.ResolvedCheckoutPath)));
+                lines.Add("resolvedNode=" + (cfg.ResolvedNodePath ?? "(未找到)") + " exists=" +
+                    (!string.IsNullOrEmpty(cfg.ResolvedNodePath) && File.Exists(cfg.ResolvedNodePath)));
                 lines.Add("port=" + cfg.port.ToString() + " open=" + NetUtil.PortOpen(cfg.port));
                 lines.Add("url=" + cfg.Url());
+                lines.Add("period=" + cfg.CurrentPeriodName() + " peak=" + cfg.peakStartHour.ToString() + "-" +
+                    cfg.peakEndHour.ToString() + " nextSwitch=" + cfg.NextTransition().ToString("MM-dd HH:mm"));
+                string key = BalanceChecker.GetApiKey(cfg);
+                lines.Add("apiKey=" + (string.IsNullOrEmpty(key) ? "(无)" : "已配置(长度 " + key.Length.ToString() + ")"));
                 lines.Add("RESULT=OK");
             }
             catch (Exception ex)

@@ -21,8 +21,11 @@ foreach ($sub in @('src', 'assets', 'tools', 'logs')) {
 
 # --- 复制客户端文件 ---
 Copy-Item (Join-Path $root 'DSHClient.exe') $targetDir -Force
-Copy-Item (Join-Path $root 'config.json') $targetDir -Force
 Copy-Item (Join-Path $root 'README.md') $targetDir -Force
+# config.json 只在目标不存在时复制（保留用户已保存的设置）
+if (-not (Test-Path (Join-Path $targetDir 'config.json'))) {
+  Copy-Item (Join-Path $root 'config.json') $targetDir -Force
+}
 Copy-Item (Join-Path $root 'src\*') (Join-Path $targetDir 'src\') -Recurse -Force
 Copy-Item (Join-Path $root 'assets\*') (Join-Path $targetDir 'assets\') -Recurse -Force
 Copy-Item (Join-Path $root 'tools\*') (Join-Path $targetDir 'tools\') -Recurse -Force

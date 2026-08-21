@@ -11,6 +11,8 @@
 
 主窗口里包含全部功能：**启动服务 / 停止服务 / 打开网页 / 查看日志 / 设置 / 退出**。
 
+- **时段提醒**：实时显示当前是「高峰期」还是「空闲期」（默认高峰 9:00–23:00，可在设置里改）；每个时段切换前 5 分钟弹 Windows 通知提醒剩余时间
+- **余额显示**：窗口实时显示 DeepSeek 账户余额（自动读取 DSH 凭据里的 API Key，无需手动配置；也可在设置里手动填），15 分钟自动刷新，也可点「刷新」
 - **托盘常驻**：最小化窗口即隐藏到托盘；图标颜色实时反映状态（绿=运行中、灰=已停止）；双击图标开网页/启动，右键菜单可启动/停止/看日志/退出
 - 客户端已在托盘运行时，再双击桌面快捷方式会把主窗口调到前台
 
@@ -25,18 +27,24 @@
 
 ```json
 {
-  "checkoutPath": "H:\\DeepseekHarness\\deepseek-harness",
-  "nodePath": "D:\\Program Files\\nodejs\\node.exe",
+  "checkoutPath": "%USERPROFILE%\\deepseek-harness",
+  "nodePath": "",
   "port": 3080,
   "autoOpenBrowser": true,
-  "minimizeToTray": true
+  "minimizeToTray": true,
+  "peakStartHour": 9,
+  "peakEndHour": 23,
+  "apiKey": ""
 }
 ```
 
-- `checkoutPath`：DSH 仓库所在目录（换机器/换目录时必改）
-- `nodePath`：node.exe 完整路径；留空则自动从常见位置/PATH 查找
+- **跨电脑可移植**：路径支持 `%环境变量%`（如 `%USERPROFILE%`）和 `~`（用户主目录），**留空则自动检测**；换电脑只需在「设置」里点「自动检测」或改一下路径
+  - `checkoutPath`：DSH 仓库目录，留空自动检测（`DSH_CHECKOUT_PATH` 环境变量 > 常见位置）
+  - `nodePath`：node.exe 路径，留空自动检测（常见安装位置 + PATH）
 - `port`：Web 服务端口，默认 3080
-- 也可直接在客户端「设置」窗口里改
+- `peakStartHour` / `peakEndHour`：高峰期时段（小时 0-23，支持跨天），其余时间为空闲期
+- `apiKey`：DeepSeek API Key（留空则自动读取 `DEEPSEEK_API_KEY` 环境变量或 `$DSH_HOME\.credentials.yaml`）
+- 也可直接在客户端「设置」窗口里改（含路径自动检测按钮）
 
 ## 目录结构
 
