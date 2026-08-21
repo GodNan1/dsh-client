@@ -525,18 +525,32 @@ namespace DSHClient
                         string json = sr.ReadToEnd();
                         JavaScriptSerializer ser = new JavaScriptSerializer();
                         Dictionary<string, object> d = ser.Deserialize<Dictionary<string, object>>(json);
-                        if (d != null && d.ContainsKey("balance_infos"))
+                        if (d == null) return "响应解析失败";
+                        if (d.ContainsKey("error"))
                         {
-                            object[] arr = d["balance_infos"] as object[];
-                            if (arr != null && arr.Length > 0)
+                            object eo = d["error"];
+                            if (eo != null) return "接口错误：" + eo.ToString();
+                            return "接口错误";
+                        }
+                        if (d.ContainsKey("balance_infos"))
+                        {
+                            // 兼容 object[] 与 ArrayList 两种反序列化结果
+                            System.Collections.IEnumerable arr = d["balance_infos"] as System.Collections.IEnumerable;
+                            if (arr != null)
                             {
-                                Dictionary<string, object> info = arr[0] as Dictionary<string, object>;
-                                if (info != null)
+                                foreach (object o in arr)
                                 {
-                                    string currency = info.ContainsKey("currency") ? info["currency"].ToString() : "CNY";
-                                    string total = info.ContainsKey("total_balance") ? info["total_balance"].ToString() : "0";
-                                    string sym = currency == "CNY" ? "¥" : (currency == "USD" ? "$" : currency + " ");
-                                    return sym + total;
+                                    Dictionary<string, object> info = o as Dictionary<string, object>;
+                                    if (info != null)
+                                    {
+                                        string currency = info.ContainsKey("currency")
+                                            ? Convert.ToString(info["currency"]) : "CNY";
+                                        string total = info.ContainsKey("total_balance")
+                                            ? Convert.ToString(info["total_balance"]) : "0";
+                                        string sym = currency == "CNY" ? "¥" :
+                                            (currency == "USD" ? "$" : currency + " ");
+                                        return sym + total;
+                                    }
                                 }
                             }
                         }
@@ -1246,6 +1260,8 @@ namespace DSHClient
                     " nextSwitch=" + cfg.NextTransition().ToString("MM-dd HH:mm") + " (北京时间)");
                 string key = BalanceChecker.GetApiKey(cfg);
                 lines.Add("apiKey=" + (string.IsNullOrEmpty(key) ? "(无)" : "已配置(长度 " + key.Length.ToString() + ")"));
+                if (!string.IsNullOrEmpty(key))
+                    lines.Add("balance=" + BalanceChecker.Query(key));
                 lines.Add("RESULT=OK");
             }
             catch (Exception ex)
