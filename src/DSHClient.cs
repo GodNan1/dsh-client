@@ -16,6 +16,7 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using System.Web.Script.Serialization;
@@ -726,6 +727,7 @@ namespace DSHClient
         private bool _balanceLoading;
         private LogForm _logForm;
         private SettingsForm _settingsForm;
+        private PluginForm _pluginForm;
 
         public MainForm(Config cfg, bool trayMode)
         {
@@ -858,6 +860,18 @@ namespace DSHClient
                 UpdatePeriod();
             };
             Controls.Add(bSet);
+
+            Button bPlugin = new Button();
+            bPlugin.Text = "插件";
+            bPlugin.Location = new Point(202, 140);
+            bPlugin.Size = new Size(88, 32);
+            bPlugin.Click += delegate
+            {
+                if (_pluginForm == null || _pluginForm.IsDisposed) _pluginForm = new PluginForm(_cfg);
+                _pluginForm.Show();
+                _pluginForm.Activate();
+            };
+            Controls.Add(bPlugin);
 
             Button bQuit = new Button();
             bQuit.Text = "退出";
@@ -1238,6 +1252,336 @@ namespace DSHClient
         }
     }
 
+    internal class PluginForm : Form
+    {
+        private readonly Config _cfg;
+        private readonly TextBox _tSpec;
+        private readonly TextBox _tOutput;
+        private readonly Label _lblInstalled;
+        private readonly Button _btnInstall;
+        private bool _busy;
+
+        public string ProfileDir
+        {
+            get
+            {
+                string home = Environment.GetEnvironmentVariable("DSH_HOME");
+                if (string.IsNullOrEmpty(home))
+                    home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
+                return Path.Combine(home, "profiles", "web");
+            }
+        }
+
+        public PluginForm(Config cfg)
+        {
+            _cfg = cfg;
+            this.Text = "插件管理";
+            this.ClientSize = new Size(720, 520);
+            this.StartPosition = FormStartPosition.CenterParent;
+            this.Font = new Font("Microsoft YaHei UI", 9F);
+
+            Label l1 = new Label(); l1.Text = "插件地址："; l1.Location = new Point(14, 14); l1.AutoSize = true;
+            _tSpec = new TextBox(); _tSpec.Location = new Point(90, 12); _tSpec.Size = new Size(428, 23);
+            _tSpec.Text = "github:user/repo";
+            Button bBrowse = new Button(); bBrowse.Text = "浏览本地目录…"; bBrowse.Location = new Point(524, 11); bBrowse.Size = new Size(112, 26);
+            bBrowse.Click += delegate
+            {
+                using (FolderBrowserDialog dlg = new FolderBrowserDialog())
+                {
+                    dlg.Description = "选择插件目录（该目录需含 package.json）";
+                    if (dlg.ShowDialog(this) == DialogResult.OK) _tSpec.Text = dlg.SelectedPath;
+                }
+            };
+
+            Label l2 = new Label();
+            l2.Text = "支持 github:用户/仓库、npm 包名、本地目录；Git 插件若被 pnpm 阻止构建脚本，会自动加许可并重试";
+            l2.Location = new Point(14, 42); l2.AutoSize = true; l2.ForeColor = Color.DimGray;
+
+            _btnInstall = new Button(); _btnInstall.Text = "安装插件"; _btnInstall.Location = new Point(14, 66); _btnInstall.Size = new Size(96, 30);
+            _btnInstall.Click += delegate { Install(); };
+            Button bOpenDir = new Button(); bOpenDir.Text = "打开插件目录"; bOpenDir.Location = new Point(116, 66); bOpenDir.Size = new Size(110, 30);
+            bOpenDir.Click += delegate
+            {
+                if (Directory.Exists(ProfileDir)) NetUtil.OpenBrowser(ProfileDir);
+                else MessageBox.Show("profile 目录还不存在。", "插件管理");
+            };
+            Button bOpenCfg = new Button(); bOpenCfg.Text = "打开 pnpm-workspace.yaml"; bOpenCfg.Location = new Point(232, 66); bOpenCfg.Size = new Size(176, 30);
+            bOpenCfg.Click += delegate
+            {
+                string f = Path.Combine(ProfileDir, "pnpm-workspace.yaml");
+                if (File.Exists(f)) NetUtil.OpenBrowser(f);
+                else MessageBox.Show("配置文件还不存在：" + f, "插件管理");
+            };
+
+            _lblInstalled = new Label(); _lblInstalled.Location = new Point(14, 106); _lblInstalled.Size = new Size(692, 56);
+            _lblInstalled.Text = "已安装插件：";
+
+            _tOutput = new TextBox(); _tOutput.Location = new Point(14, 166); _tOutput.Size = new Size(692, 340);
+            _tOutput.Multiline = true; _tOutput.ReadOnly = true; _tOutput.ScrollBars = ScrollBars.Both;
+            _tOutput.WordWrap = false; _tOutput.Font = new Font("Consolas", 9F);
+
+            Controls.Add(l1); Controls.Add(_tSpec); Controls.Add(bBrowse);
+            Controls.Add(l2);
+            Controls.Add(_btnInstall); Controls.Add(bOpenDir); Controls.Add(bOpenCfg);
+            Controls.Add(_lblInstalled);
+            Controls.Add(_tOutput);
+
+            RefreshInstalled();
+        }
+
+        private void RefreshInstalled()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("已安装插件：");
+            try
+            {
+                string pf = Path.Combine(ProfileDir, "package.json");
+                if (File.Exists(pf))
+                {
+                    JavaScriptSerializer ser = new JavaScriptSerializer();
+                    Dictionary<string, object> d = ser.Deserialize<Dictionary<string, object>>(
+                        File.ReadAllText(pf, Encoding.UTF8));
+                    if (d != null)
+                    {
+                        Dictionary<string, object> dd = d["dsh"] as Dictionary<string, object>;
+                        if (dd != null)
+                        {
+                            Dictionary<string, object> dp = dd["profile"] as Dictionary<string, object>;
+                            if (dp != null)
+                            {
+                                System.Collections.IEnumerable arr = dp["bundles"] as System.Collections.IEnumerable;
+                                if (arr != null)
+                                {
+                                    foreach (object o in arr)
+                                        sb.Append("\n  ● " + o.ToString() + "（配置层）");
+                                }
+                            }
+                        }
+                        Dictionary<string, object> deps = d["dependencies"] as Dictionary<string, object>;
+                        if (deps != null && deps.Count > 0)
+                        {
+                            foreach (KeyValuePair<string, object> kv in deps)
+                                sb.Append("\n  • " + kv.Key + "（" + kv.Value + "）");
+                        }
+                    }
+                    if (sb.Length < 8) sb.Append("\n  （暂无，点「安装插件」添加）");
+                }
+                else sb.Append("\n  profile 尚未初始化（首次安装会自动创建）");
+            }
+            catch { }
+            _lblInstalled.Text = sb.ToString();
+        }
+
+        private void AppendOutput(string text)
+        {
+            try
+            {
+                this.Invoke((Action)delegate
+                {
+                    _tOutput.AppendText(text);
+                    if (_tOutput.TextLength > 400000)
+                        _tOutput.Text = _tOutput.Text.Substring(_tOutput.TextLength - 300000);
+                    _tOutput.SelectionStart = _tOutput.TextLength;
+                    _tOutput.ScrollToCaret();
+                });
+            }
+            catch { }
+        }
+
+        private void Install() { Install(_tSpec.Text.Trim()); }
+
+        private void Install(string spec)
+        {
+            if (_busy) return;
+            if (string.IsNullOrEmpty(spec)) { MessageBox.Show("请先填写插件地址。", "插件管理"); return; }
+            string checkout = _cfg.ResolvedCheckoutPath;
+            string node = _cfg.ResolvedNodePath;
+            if (string.IsNullOrEmpty(checkout) || !Directory.Exists(checkout))
+            { MessageBox.Show("找不到 DSH 仓库目录，请在「设置」里配置。", "插件管理"); return; }
+            if (string.IsNullOrEmpty(node) || !File.Exists(node))
+            { MessageBox.Show("找不到 node.exe，请在「设置」里配置。", "插件管理"); return; }
+
+            _busy = true;
+            _btnInstall.Enabled = false;
+            _tOutput.Clear();
+            AppendOutput("> dsh plugin --profile web add " + spec + "\r\n");
+
+            string args = "--import tsx/esm apps/cli/src/bin.ts plugin --profile web add \"" +
+                spec.Replace("\"", "\\\"") + "\"";
+            Process p = new Process();
+            p.StartInfo.FileName = node;
+            p.StartInfo.Arguments = args;
+            p.StartInfo.WorkingDirectory = checkout;
+            p.StartInfo.UseShellExecute = false;
+            p.StartInfo.CreateNoWindow = true;
+            p.StartInfo.RedirectStandardOutput = true;
+            p.StartInfo.RedirectStandardError = true;
+            p.StartInfo.StandardOutputEncoding = Encoding.UTF8;
+            p.StartInfo.StandardErrorEncoding = Encoding.UTF8;
+            StringBuilder captured = new StringBuilder();
+            object capLock = new object();
+            p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+            {
+                if (e.Data != null) { AppendOutput(e.Data + "\r\n"); lock (capLock) captured.AppendLine(e.Data); }
+            };
+            p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+            {
+                if (e.Data != null) { AppendOutput(e.Data + "\r\n"); lock (capLock) captured.AppendLine(e.Data); }
+            };
+            p.Exited += delegate
+            {
+                Thread.Sleep(300); // 等输出流刷新完
+                int code = p.ExitCode;
+                _busy = false;
+                try { this.Invoke((Action)delegate { _btnInstall.Enabled = true; }); } catch { }
+                AppendOutput("\r\n> 退出码: " + code.ToString() + "\r\n");
+                if (code == 0)
+                {
+                    try { this.Invoke((Action)delegate { RefreshInstalled(); }); } catch { }
+                    AppendOutput("> 安装完成。若 DSH Web 正在运行，请「停止服务」后重新「启动服务」使插件层生效。\r\n");
+                }
+                else
+                {
+                    string all;
+                    lock (capLock) all = captured.ToString();
+                    if (LooksLikeBuildBlock(all))
+                    {
+                        try { this.Invoke((Action)delegate { HandleBuildBlock(all, spec); }); } catch { }
+                    }
+                    else
+                    {
+                        AppendOutput("> 安装失败，请根据上方输出排查（可点「打开 pnpm-workspace.yaml」检查配置）。\r\n");
+                    }
+                }
+            };
+            p.EnableRaisingEvents = true;
+            try
+            {
+                p.Start();
+                p.BeginOutputReadLine();
+                p.BeginErrorReadLine();
+            }
+            catch (Exception ex)
+            {
+                _busy = false;
+                _btnInstall.Enabled = true;
+                AppendOutput("> 启动失败: " + ex.Message + "\r\n");
+            }
+        }
+
+        private bool LooksLikeBuildBlock(string text)
+        {
+            return text.IndexOf("build script", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   text.IndexOf("Ignored build scripts", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   text.IndexOf("onlyBuiltDependencies", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   text.IndexOf("allowBuilds", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   text.IndexOf("approve-builds", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // 从 pnpm 输出提取被阻止构建的包名；提取不到时从 git 地址猜包名
+        private List<string> ParseIgnoredPackages(string text, string spec)
+        {
+            List<string> names = new List<string>();
+            int idx = text.IndexOf("Ignored build scripts", StringComparison.OrdinalIgnoreCase);
+            if (idx >= 0)
+            {
+                int colon = text.IndexOf(':', idx);
+                if (colon >= 0)
+                {
+                    string rest = text.Substring(colon + 1);
+                    int end = rest.IndexOfAny(new char[] { '\r', '\n' }, 0);
+                    if (end > 0) rest = rest.Substring(0, end);
+                    string[] seps = rest.IndexOf(',') >= 0 ? rest.Split(',') : rest.Split(' ');
+                    foreach (string raw in seps)
+                    {
+                        string t = raw.Trim().Trim(new char[] { '.', '"', '(', ')' });
+                        if (t.Length == 0) continue;
+                        if (Regex.IsMatch(t, "^@?[a-zA-Z0-9][a-zA-Z0-9._/-]*$") && !names.Contains(t))
+                            names.Add(t);
+                    }
+                }
+            }
+            if (names.Count == 0)
+            {
+                string s = spec.Trim();
+                int hash = s.IndexOf('#');
+                if (hash >= 0) s = s.Substring(0, hash);
+                int slash = s.LastIndexOf('/');
+                if (slash >= 0) s = s.Substring(slash + 1);
+                s = s.Replace(".git", "");
+                if (Regex.IsMatch(s, "^@?[a-zA-Z0-9][a-zA-Z0-9._-]*$")) names.Add(s);
+            }
+            return names;
+        }
+
+        // 往 pnpm-workspace.yaml 追加 onlyBuiltDependencies
+        private bool AppendOnlyBuiltDependencies(List<string> names)
+        {
+            try
+            {
+                if (!Directory.Exists(ProfileDir)) Directory.CreateDirectory(ProfileDir);
+                string yaml = Path.Combine(ProfileDir, "pnpm-workspace.yaml");
+                List<string> lines = new List<string>();
+                if (File.Exists(yaml)) lines.AddRange(File.ReadAllLines(yaml, Encoding.UTF8));
+                int idx = -1;
+                for (int i = 0; i < lines.Count; i++)
+                    if (lines[i].Trim().StartsWith("onlyBuiltDependencies:")) { idx = i; break; }
+                if (idx >= 0)
+                {
+                    for (int i = idx + 1; i < lines.Count; i++)
+                    {
+                        string t = lines[i].Trim();
+                        if (t.StartsWith("- ")) names.Remove(t.Substring(2).Trim());
+                        else break;
+                    }
+                    foreach (string n in names) lines.Insert(idx + 1, "  - " + n);
+                }
+                else
+                {
+                    if (lines.Count > 0 && lines[lines.Count - 1].Trim().Length > 0) lines.Add("");
+                    lines.Add("onlyBuiltDependencies:");
+                    foreach (string n in names) lines.Add("  - " + n);
+                }
+                File.WriteAllLines(yaml, lines.ToArray(), new UTF8Encoding(false));
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // 处理 pnpm 阻止构建脚本：确认后自动加许可并重试
+        private void HandleBuildBlock(string all, string spec)
+        {
+            List<string> names = ParseIgnoredPackages(all, spec);
+            if (names.Count == 0)
+            {
+                AppendOutput("> 检测到 pnpm 阻止构建脚本，但未能自动识别包名。\r\n" +
+                    "> 请点「打开 pnpm-workspace.yaml」，把 pnpm 提示的包名加入 onlyBuiltDependencies，再点「安装插件」。\r\n");
+                return;
+            }
+            DialogResult r = MessageBox.Show(this,
+                "pnpm 阻止了以下包的构建脚本（Git 插件的 prepare 脚本需要许可）：\n\n" +
+                string.Join("\n", names.ToArray()) +
+                "\n\n是否自动写入 pnpm-workspace.yaml 的 onlyBuiltDependencies 并重新安装？",
+                "插件管理", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r == DialogResult.Yes)
+            {
+                if (AppendOnlyBuiltDependencies(names))
+                {
+                    AppendOutput("> 已写入 onlyBuiltDependencies: " + string.Join(", ", names.ToArray()) + "，自动重试…\r\n");
+                    Install(spec);
+                }
+                else
+                {
+                    AppendOutput("> 写入 pnpm-workspace.yaml 失败，请手动编辑后重试。\r\n");
+                }
+            }
+            else
+            {
+                AppendOutput("> 已取消自动处理，可手动编辑 pnpm-workspace.yaml 后重试。\r\n");
+            }
+        }
+    }
+
     internal static class Selftest
     {
         public static void Run()
@@ -1258,6 +1602,11 @@ namespace DSHClient
                 lines.Add("url=" + cfg.Url());
                 lines.Add("period=" + cfg.CurrentPeriodName() + " windows=" + cfg.PeakSummary() +
                     " nextSwitch=" + cfg.NextTransition().ToString("MM-dd HH:mm") + " (北京时间)");
+                string home = Environment.GetEnvironmentVariable("DSH_HOME");
+                if (string.IsNullOrEmpty(home))
+                    home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
+                string pf = Path.Combine(home, "profiles", "web");
+                lines.Add("pluginProfile=" + pf + " exists=" + Directory.Exists(pf));
                 string key = BalanceChecker.GetApiKey(cfg);
                 lines.Add("apiKey=" + (string.IsNullOrEmpty(key) ? "(无)" : "已配置(长度 " + key.Length.ToString() + ")"));
                 if (!string.IsNullOrEmpty(key))
