@@ -6,7 +6,10 @@
   3) 清理旧版平铺文件和桌面旧快捷方式，只创建一个「DSH 客户端」
   用法：
     powershell -NoProfile -ExecutionPolicy Bypass -File tools\install-shortcuts.ps1
+    powershell -NoProfile -ExecutionPolicy Bypass -File tools\install-shortcuts.ps1 -Silent   # 不弹完成提示
 #>
+[CmdletBinding()]
+param([switch]$Silent)
 $ErrorActionPreference = 'Stop'
 $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $toolsDir
@@ -45,7 +48,10 @@ foreach ($f in $obsolete) {
 
 $exe = Join-Path $targetDir 'DSHClient.exe'
 if (-not (Test-Path -LiteralPath $exe)) {
-  [System.Windows.Forms.MessageBox]::Show("找不到 $exe，请先运行 src\build.ps1 编译。", 'DSH 客户端', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+  Write-Host "找不到 $exe，请先运行 src\build.ps1 编译。" -ForegroundColor Red
+  if (-not $Silent) {
+    [System.Windows.Forms.MessageBox]::Show("找不到 $exe，请先运行 src\build.ps1 编译。", 'DSH 客户端', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+  }
   exit 1
 }
 
@@ -63,4 +69,6 @@ $sc.Save()
 
 $msg = "部署完成：$targetDir`n桌面快捷方式：$desktop\DSH 客户端.lnk"
 Write-Host $msg
-try { [System.Windows.Forms.MessageBox]::Show($msg, 'DSH 客户端') | Out-Null } catch {}
+if (-not $Silent) {
+  try { [System.Windows.Forms.MessageBox]::Show($msg, 'DSH 客户端') | Out-Null } catch {}
+}

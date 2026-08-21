@@ -112,6 +112,37 @@ namespace DSHClient
         }
     }
 
+    // 高峰时段（每段 开始-结束 小时，0-23；end<=start 表示跨天）
+    internal class PeakWindow
+    {
+        public int start;
+        public int end;
+
+        public PeakWindow() { }
+        public PeakWindow(int s, int e) { start = s; end = e; }
+
+        public bool Contains(int hour)
+        {
+            if (start == end) return false;
+            if (start < end) return hour >= start && hour < end;
+            return hour >= start || hour < end; // 跨天（如 22-6）
+        }
+
+        // 该窗口的下一个边界时刻（切换点）
+        public DateTime NextBoundary(DateTime now)
+        {
+            if (Contains(now.Hour))
+            {
+                DateTime n = now.Date.AddHours(end);
+                if (n <= now) n = n.AddDays(1);
+                return n;
+            }
+            DateTime m = now.Date.AddHours(start);
+            if (m <= now) m = m.AddDays(1);
+            return m;
+        }
+    }
+
     internal class Config
     {
         // 路径支持 %环境变量% 和 ~（用户主目录）；留空则自动检测
@@ -120,11 +151,17 @@ namespace DSHClient
         public int port = 3080;
         public bool autoOpenBrowser = true;
         public bool minimizeToTray = true;
-        // 高峰期时段（小时 0-23，跨天也支持），其余时间为空闲期
-        public int peakStartHour = 9;
-        public int peakEndHour = 23;
+        // 高峰期时段（北京时间），其余时间为空闲期
+        public List<PeakWindow> peakWindows = new List<PeakWindow>();
         // DeepSeek API Key（留空则读取 DEEPSEEK_API_KEY 环境变量或 DSH 的 .credentials.yaml）
         public string apiKey = "";
+
+        public Config()
+        {
+            // 默认高峰：北京时间 9:00-12:00、14:00-18:00
+            peakWindows.Add(new PeakWindow(9, 12));
+            peakWindows.Add(new PeakWindow(14, 18));
+        }
 
         public string Dir = "";
         public string ConfigFile { get { return Path.Combine(Dir, "config.json"); } }
@@ -155,10 +192,39 @@ namespace DSHClient
                         if (s != null) c.nodePath = s;
                         c.autoOpenBrowser = GetBool(d, "autoOpenBrowser", c.autoOpenBrowser);
                         c.minimizeToTray = GetBool(d, "minimizeToTray", c.minimizeToTray);
-                        int ph = GetInt(d, "peakStartHour", -1);
-                        if (ph >= 0 && ph <= 23) c.peakStartHour = ph;
-                        ph = GetInt(d, "peakEndHour", -1);
-                        if (ph >= 0 && ph <= 23) c.peakEndHour = ph;
+                        // 高峰时段列表（新格式）
+                        object wobj = null;
+                        if (d.TryGetValue("peakWindows", out wobj) && wobj != null)
+                        {
+                            object[] arr = wobj as object[];
+                            if (arr != null && arr.Length > 0)
+                            {
+                                List<PeakWindow> list = new List<PeakWindow>();
+                                foreach (object o in arr)
+                                {
+                                    Dictionary<string, object> wd = o as Dictionary<string, object>;
+                                    if (wd != null)
+                                    {
+                                        int ws = GetInt(wd, "start", -1);
+                                        int we = GetInt(wd, "end", -1);
+                                        if (ws >= 0 && ws <= 23 && we >= 0 && we <= 23)
+                                            list.Add(new PeakWindow(ws, we));
+                                    }
+                                }
+                                if (list.Count > 0) c.peakWindows = list;
+                            }
+                        }
+                        else
+                        {
+                            // 兼容旧格式 peakStartHour/peakEndHour
+                            int ls = GetInt(d, "peakStartHour", -1);
+                            int le = GetInt(d, "peakEndHour", -1);
+                            if (ls >= 0 && ls <= 23 && le >= 0 && le <= 23 && ls != le)
+                            {
+                                c.peakWindows = new List<PeakWindow>();
+                                c.peakWindows.Add(new PeakWindow(ls, le));
+                            }
+                        }
                         s = GetStr(d, "apiKey", null);
                         if (!string.IsNullOrEmpty(s)) c.apiKey = s;
                     }
@@ -176,8 +242,15 @@ namespace DSHClient
             d["port"] = port;
             d["autoOpenBrowser"] = autoOpenBrowser;
             d["minimizeToTray"] = minimizeToTray;
-            d["peakStartHour"] = peakStartHour;
-            d["peakEndHour"] = peakEndHour;
+            List<Dictionary<string, object>> wins = new List<Dictionary<string, object>>();
+            foreach (PeakWindow w in peakWindows)
+            {
+                Dictionary<string, object> wd = new Dictionary<string, object>();
+                wd["start"] = w.start;
+                wd["end"] = w.end;
+                wins.Add(wd);
+            }
+            d["peakWindows"] = wins;
             d["apiKey"] = apiKey;
             try
             {
@@ -300,30 +373,48 @@ namespace DSHClient
             return null;
         }
 
-        // ---- 高峰期 / 空闲期 ----
-        public bool IsPeakNow()
+        // ---- 高峰期 / 空闲期（北京时间 UTC+8）----
+        public DateTime NowBJ() { return DateTime.UtcNow.AddHours(8); }
+
+        public bool IsPeakAt(int hour)
         {
-            int hour = DateTime.Now.Hour;
-            int s = peakStartHour, e = peakEndHour;
-            if (s == e) return false;
-            if (s < e) return hour >= s && hour < e;
-            return hour >= s || hour < e; // 跨天（如 22 点-次日 6 点）
+            foreach (PeakWindow w in peakWindows)
+                if (w.Contains(hour)) return true;
+            return false;
         }
+
+        public bool IsPeakNow() { return IsPeakAt(NowBJ().Hour); }
 
         public string CurrentPeriodName() { return IsPeakNow() ? "高峰期" : "空闲期"; }
         public string NextPeriodName() { return IsPeakNow() ? "空闲期" : "高峰期"; }
 
+        // 当前所在高峰窗口（如 "9-12"），空闲期返回 ""
+        public string CurrentWindowLabel()
+        {
+            int hour = NowBJ().Hour;
+            foreach (PeakWindow w in peakWindows)
+                if (w.Contains(hour)) return w.start + "-" + w.end;
+            return "";
+        }
+
+        // 最近的下一次时段切换时间
         public DateTime NextTransition()
         {
-            if (IsPeakNow())
+            DateTime now = NowBJ();
+            DateTime best = DateTime.MaxValue;
+            foreach (PeakWindow w in peakWindows)
             {
-                DateTime n = DateTime.Today.AddHours(peakEndHour);
-                if (n <= DateTime.Now) n = n.AddDays(1);
-                return n;
+                DateTime b = w.NextBoundary(now);
+                if (b < best) best = b;
             }
-            DateTime m = DateTime.Today.AddHours(peakStartHour);
-            if (m <= DateTime.Now) m = m.AddDays(1);
-            return m;
+            return best;
+        }
+
+        public string PeakSummary()
+        {
+            List<string> parts = new List<string>();
+            foreach (PeakWindow w in peakWindows) parts.Add(w.start + "-" + w.end);
+            return string.Join("、", parts.ToArray());
         }
     }
 
@@ -842,18 +933,22 @@ namespace DSHClient
             }
         }
 
-        // 高峰期/空闲期显示 + 切换前 5 分钟 Windows 通知
+        // 高峰期/空闲期显示 + 切换前 5 分钟 Windows 通知（按北京时间）
         private void UpdatePeriod()
         {
-            TimeSpan remain = _cfg.NextTransition() - DateTime.Now;
-            _lblPeriod.Text = "● " + _cfg.CurrentPeriodName() + " · 距" + _cfg.NextPeriodName() +
+            DateTime now = _cfg.NowBJ();
+            TimeSpan remain = _cfg.NextTransition() - now;
+            string cur = _cfg.CurrentPeriodName();
+            string win = _cfg.CurrentWindowLabel();
+            string prefix = cur + (win.Length > 0 ? "（" + win + "）" : "");
+            _lblPeriod.Text = "● " + prefix + " · 距" + _cfg.NextPeriodName() +
                 "（" + _cfg.NextTransition().ToString("HH:mm") + "）还有 " + FormatRemain(remain);
             if (remain.TotalMinutes > 0 && remain.TotalMinutes <= 5 &&
                 _lastNotifiedTransition < _cfg.NextTransition().AddMinutes(-6))
             {
                 _lastNotifiedTransition = _cfg.NextTransition();
                 _tray.ShowBalloonTip(8000, "DSH 时段提醒",
-                    "当前" + _cfg.CurrentPeriodName() + "还剩 " + FormatRemain(remain) +
+                    "当前" + prefix + "还剩 " + FormatRemain(remain) +
                     "，即将在 " + _cfg.NextTransition().ToString("HH:mm") + " 切换到" + _cfg.NextPeriodName() + "。",
                     ToolTipIcon.Info);
             }
@@ -1027,8 +1122,7 @@ namespace DSHClient
         private readonly TextBox _tCheckout;
         private readonly TextBox _tNode;
         private readonly TextBox _tPort;
-        private readonly TextBox _tPeakStart;
-        private readonly TextBox _tPeakEnd;
+        private readonly TextBox _tPeak;
         private readonly TextBox _tApiKey;
         private readonly CheckBox _cOpen;
         private readonly CheckBox _cTray;
@@ -1067,11 +1161,9 @@ namespace DSHClient
             Label l3 = new Label(); l3.Text = "端口："; l3.Location = new Point(16, 120); l3.AutoSize = true;
             _tPort = new TextBox(); _tPort.Text = cfg.port.ToString(); _tPort.Location = new Point(16, 140); _tPort.Size = new Size(70, 23);
 
-            Label l4 = new Label(); l4.Text = "高峰期时段（小时 0-23，支持跨天）："; l4.Location = new Point(16, 172); l4.AutoSize = true;
-            _tPeakStart = new TextBox(); _tPeakStart.Text = cfg.peakStartHour.ToString(); _tPeakStart.Location = new Point(16, 194); _tPeakStart.Size = new Size(50, 23);
-            Label l4b = new Label(); l4b.Text = "～"; l4b.Location = new Point(70, 196); l4b.AutoSize = true;
-            _tPeakEnd = new TextBox(); _tPeakEnd.Text = cfg.peakEndHour.ToString(); _tPeakEnd.Location = new Point(88, 194); _tPeakEnd.Size = new Size(50, 23);
-            Label l4c = new Label(); l4c.Text = "（其余时间为空闲期）"; l4c.Location = new Point(146, 196); l4c.AutoSize = true;
+            Label l4 = new Label(); l4.Text = "高峰时段（北京时间，每段 开始-结束，逗号分隔，可跨天）："; l4.Location = new Point(16, 172); l4.AutoSize = true;
+            _tPeak = new TextBox(); _tPeak.Text = cfg.PeakSummary(); _tPeak.Location = new Point(16, 194); _tPeak.Size = new Size(220, 23);
+            Label l4c = new Label(); l4c.Text = "如 9-12, 14-18（其余为空闲）"; l4c.Location = new Point(244, 196); l4c.AutoSize = true;
 
             Label l5 = new Label(); l5.Text = "DeepSeek API Key（留空=读取环境变量或 DSH 凭据）："; l5.Location = new Point(16, 224); l5.AutoSize = true;
             _tApiKey = new TextBox(); _tApiKey.Text = cfg.apiKey; _tApiKey.Location = new Point(16, 246); _tApiKey.Size = new Size(398, 23);
@@ -1087,7 +1179,7 @@ namespace DSHClient
             Controls.Add(l1); Controls.Add(_tCheckout); Controls.Add(bDetectCheckout);
             Controls.Add(l2); Controls.Add(_tNode); Controls.Add(bDetectNode);
             Controls.Add(l3); Controls.Add(_tPort);
-            Controls.Add(l4); Controls.Add(_tPeakStart); Controls.Add(l4b); Controls.Add(_tPeakEnd); Controls.Add(l4c);
+            Controls.Add(l4); Controls.Add(_tPeak); Controls.Add(l4c);
             Controls.Add(l5); Controls.Add(_tApiKey);
             Controls.Add(_cOpen); Controls.Add(_cTray);
             Controls.Add(bOk); Controls.Add(bCancel);
@@ -1103,9 +1195,30 @@ namespace DSHClient
             _cfg.nodePath = _tNode.Text.Trim();
             _cfg.autoOpenBrowser = _cOpen.Checked;
             _cfg.minimizeToTray = _cTray.Checked;
-            int h;
-            if (int.TryParse(_tPeakStart.Text.Trim(), out h) && h >= 0 && h <= 23) _cfg.peakStartHour = h;
-            if (int.TryParse(_tPeakEnd.Text.Trim(), out h) && h >= 0 && h <= 23) _cfg.peakEndHour = h;
+            // 高峰时段解析：每段 开始-结束，逗号分隔
+            List<PeakWindow> wins = new List<PeakWindow>();
+            string[] toks = _tPeak.Text.Split(new char[] { ',', '，', '、', ';', '；' }, StringSplitOptions.RemoveEmptyEntries);
+            bool ok = toks.Length > 0;
+            foreach (string t in toks)
+            {
+                string[] ab = t.Trim().Split('-');
+                int s, e;
+                if (ab.Length == 2 &&
+                    int.TryParse(ab[0].Trim(), out s) && int.TryParse(ab[1].Trim(), out e) &&
+                    s >= 0 && s <= 23 && e >= 0 && e <= 23 && s != e)
+                {
+                    wins.Add(new PeakWindow(s, e));
+                }
+                else { ok = false; break; }
+            }
+            if (!ok)
+            {
+                MessageBox.Show("高峰时段格式不对，示例：9-12, 14-18（每段为 开始-结束 小时，逗号分隔）",
+                    "设置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                this.DialogResult = DialogResult.None;
+                return;
+            }
+            _cfg.peakWindows = wins;
             _cfg.apiKey = _tApiKey.Text.Trim();
             _cfg.Save();
         }
@@ -1129,8 +1242,8 @@ namespace DSHClient
                     (!string.IsNullOrEmpty(cfg.ResolvedNodePath) && File.Exists(cfg.ResolvedNodePath)));
                 lines.Add("port=" + cfg.port.ToString() + " open=" + NetUtil.PortOpen(cfg.port));
                 lines.Add("url=" + cfg.Url());
-                lines.Add("period=" + cfg.CurrentPeriodName() + " peak=" + cfg.peakStartHour.ToString() + "-" +
-                    cfg.peakEndHour.ToString() + " nextSwitch=" + cfg.NextTransition().ToString("MM-dd HH:mm"));
+                lines.Add("period=" + cfg.CurrentPeriodName() + " windows=" + cfg.PeakSummary() +
+                    " nextSwitch=" + cfg.NextTransition().ToString("MM-dd HH:mm") + " (北京时间)");
                 string key = BalanceChecker.GetApiKey(cfg);
                 lines.Add("apiKey=" + (string.IsNullOrEmpty(key) ? "(无)" : "已配置(长度 " + key.Length.ToString() + ")"));
                 lines.Add("RESULT=OK");
